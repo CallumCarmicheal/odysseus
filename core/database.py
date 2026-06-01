@@ -5,6 +5,7 @@ from sqlalchemy import create_engine, Column, String, Text, Boolean, DateTime, I
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.declarative import declarative_base, declared_attr
 from sqlalchemy.orm import relationship, sessionmaker, backref
+from core.migrations import ensure_schema_migrations
 
 logger = logging.getLogger(__name__)
 
@@ -1488,6 +1489,7 @@ def init_db():
     Initialize the database by creating all tables.
     Should be called when starting the application.
     """
+    ensure_schema_migrations(engine)
     _migrate_model_endpoints()
     Base.metadata.create_all(bind=engine)
     _migrate_add_hidden_models_column()
