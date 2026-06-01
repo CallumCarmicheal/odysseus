@@ -145,6 +145,7 @@ class Session(TimestampMixin, Base):
     endpoint_url = Column(String, nullable=False)
     model = Column(String, nullable=False)
     owner = Column(String, nullable=True, index=True)  # username; null = legacy/shared
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     
     # Configuration flags
     rag = Column(Boolean, default=False)
@@ -257,6 +258,7 @@ class Document(TimestampMixin, Base):
     # SET NULL), orphaning the doc and making it vanish from the owner's
     # Library + search. Owning the row directly is robust against that.
     owner           = Column(String, nullable=True, index=True)
+    owner_id        = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     tidy_verdict    = Column(String, nullable=True)        # "keep", "junk", or None (not yet reviewed)
     # Provenance: if this document was created by opening an email attachment,
     # these point back to the source email so the "Sign and reply" flow can
@@ -295,6 +297,7 @@ class GalleryAlbum(TimestampMixin, Base):
     description = Column(Text, default="")
     cover_id    = Column(String, nullable=True)  # GalleryImage.id for cover photo
     owner       = Column(String, nullable=True, index=True)
+    owner_id    = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
 
     images = relationship("GalleryImage", back_populates="album")
 
@@ -314,6 +317,7 @@ class GalleryImage(TimestampMixin, Base):
     session_id = Column(String, ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True, index=True)
     album_id   = Column(String, ForeignKey("gallery_albums.id", ondelete="SET NULL"), nullable=True, index=True)
     owner      = Column(String, nullable=True, index=True)
+    owner_id   = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     is_active  = Column(Boolean, default=True)
     favorite   = Column(Boolean, default=False)
 
@@ -355,6 +359,7 @@ class EmailAccount(TimestampMixin, Base):
 
     id             = Column(String, primary_key=True, index=True)
     owner          = Column(String, nullable=True, index=True)
+    owner_id       = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     name           = Column(String, nullable=False)  # Display name: "Work", "Personal", etc.
     is_default     = Column(Boolean, default=False, nullable=False)
     enabled        = Column(Boolean, default=True, nullable=False)
@@ -401,6 +406,7 @@ class ModelEndpoint(TimestampMixin, Base):
     # is the historical default. When non-null, the model picker only shows
     # the endpoint to that user (admins always see everything).
     owner = Column(String, nullable=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
 
 class McpServer(TimestampMixin, Base):
     """Admin-configured MCP (Model Context Protocol) tool servers."""
@@ -425,6 +431,7 @@ class Comparison(TimestampMixin, Base):
     id = Column(String, primary_key=True, index=True)
     session_id = Column(String, nullable=True)     # Parent session context (optional)
     owner = Column(String, nullable=True, index=True)  # username
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     prompt = Column(Text, nullable=False)
     model_a = Column(String, nullable=False)
     model_b = Column(String, nullable=False)
@@ -458,6 +465,7 @@ class Signature(TimestampMixin, Base):
 
     id = Column(String, primary_key=True, index=True)
     owner = Column(String, nullable=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     name = Column(String, nullable=False, default="Signature")
     data_png = Column(EncryptedText, nullable=False)   # base64 PNG, encrypted at rest
     width = Column(Integer, nullable=True)
@@ -471,6 +479,7 @@ class ApiToken(TimestampMixin, Base):
 
     id = Column(String, primary_key=True, index=True)
     owner = Column(String, nullable=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     name = Column(String, nullable=False)
     token_hash = Column(String, nullable=False)
     token_prefix = Column(String, nullable=False)  # first 8 chars for display
@@ -506,6 +515,7 @@ class UserTool(TimestampMixin, Base):
     scope         = Column(String, nullable=False, default="global")  # "global" or session_id
     session_id    = Column(String, ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True)
     owner         = Column(String, nullable=True, index=True)      # username
+    owner_id      = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     is_pinned     = Column(Boolean, default=False)
     is_active     = Column(Boolean, default=True)
     version       = Column(Integer, default=1)
@@ -543,6 +553,7 @@ class CrewMember(TimestampMixin, Base):
 
     id            = Column(String, primary_key=True, index=True)
     owner         = Column(String, nullable=True, index=True)
+    owner_id      = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     name          = Column(String, nullable=False)
     avatar        = Column(String, nullable=True)
     user_name     = Column(String, nullable=True)          # what they call the user
@@ -567,6 +578,7 @@ class ScheduledTask(TimestampMixin, Base):
 
     id             = Column(String, primary_key=True, index=True)
     owner          = Column(String, nullable=True, index=True)
+    owner_id       = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     name           = Column(String, nullable=False, default="Untitled Task")
     prompt         = Column(Text, nullable=True)              # LLM prompt (for task_type="llm")
     task_type      = Column(String, default="llm")            # "llm" | "action"
@@ -619,6 +631,7 @@ class EditorDraft(TimestampMixin, Base):
 
     id              = Column(String, primary_key=True, index=True)
     owner           = Column(String, nullable=True, index=True)
+    owner_id        = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     name            = Column(String, nullable=False, default="Untitled")
     # If the draft was opened FROM a gallery photo, point back at it so we
     # can show "Resuming edit of <photo>" and so reopening that photo picks
@@ -683,6 +696,7 @@ class Memory(Base):
 
     # Owner (username)
     owner = Column(String, nullable=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
 
     # Reference to session (nullable)
     session_id = Column(String, ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -1023,6 +1037,94 @@ def _migrate_add_multiuser_owner_columns():
     # documents derived ownership from their session join until this column
     # existed; the legacy-owner sweep (below) backfills it on the next boot.
     _migrate_add_owner_to_table("documents", "ix_documents_owner")
+
+
+_OWNER_ID_BACKFILL_TABLES = (
+    "sessions",
+    "documents",
+    "gallery_albums",
+    "gallery_images",
+    "email_accounts",
+    "model_endpoints",
+    "comparisons",
+    "signatures",
+    "api_tokens",
+    "user_tools",
+    "crew_members",
+    "scheduled_tasks",
+    "editor_drafts",
+    "memories",
+    "notes",
+    "calendars",
+    "integrations",
+    # Historical migrations may add owner columns to these tables even though
+    # some ORM classes do not currently map them.
+    "calendar_events",
+    "gallery_people",
+    "task_runs",
+    "user_tool_data",
+    "webhooks",
+)
+
+
+def backfill_owner_ids(target_engine=None):
+    """Add/backfill owner_id columns from legacy username owner columns.
+
+    This is intentionally additive: routes can keep filtering on `owner`
+    while later commits switch them to `owner_id`. Running it after auth import
+    also handles first-boot deployments where users were not in app.db yet when
+    init_db() first ran.
+    """
+    target_engine = target_engine or engine
+    logger = logging.getLogger(__name__)
+    try:
+        with target_engine.begin() as conn:
+            user_table = conn.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='users'"
+            )).first()
+            if user_table is None:
+                return
+
+            user_columns = [row[1] for row in conn.execute(text("PRAGMA table_info(users)")).fetchall()]
+            if "id" not in user_columns or "username" not in user_columns:
+                return
+
+            for table in _OWNER_ID_BACKFILL_TABLES:
+                exists = conn.execute(text(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=:table"
+                ), {"table": table}).first()
+                if exists is None:
+                    continue
+
+                columns = [row[1] for row in conn.execute(text(f"PRAGMA table_info({table})")).fetchall()]
+                if "owner" not in columns:
+                    continue
+                if "owner_id" not in columns:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN owner_id INTEGER"))
+                    conn.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_owner_id ON {table}(owner_id)"))
+                    columns.append("owner_id")
+                    logger.info("Migrated: added owner_id column to %s", table)
+
+                result = conn.execute(text(f"""
+                    UPDATE {table}
+                       SET owner_id = (
+                           SELECT users.id
+                             FROM users
+                            WHERE users.username = {table}.owner
+                       )
+                     WHERE owner_id IS NULL
+                       AND owner IS NOT NULL
+                       AND owner != ''
+                       AND EXISTS (
+                           SELECT 1
+                             FROM users
+                            WHERE users.username = {table}.owner
+                       )
+                """))
+                if result.rowcount and result.rowcount > 0:
+                    logger.info("Backfilled owner_id on %d row(s) in %s", result.rowcount, table)
+    except Exception as e:
+        logger.warning(f"owner_id backfill migration failed: {e}")
 
 
 def _migrate_add_api_token_scopes_column():
@@ -1414,6 +1516,7 @@ class Note(TimestampMixin, Base):
 
     id         = Column(String, primary_key=True, index=True)
     owner      = Column(String, nullable=True, index=True)
+    owner_id   = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     title      = Column(String, default="")
     content    = Column(Text, nullable=True)
     items      = Column(Text, nullable=True)       # JSON string of [{text, done}]
@@ -1444,6 +1547,7 @@ class CalendarCal(TimestampMixin, Base):
 
     id    = Column(String, primary_key=True, index=True)
     owner = Column(String, nullable=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     name  = Column(String, nullable=False)
     color = Column(String, default="#5b8abf")
     source = Column(String, default="local")  # "local" or "timetree"
@@ -1483,6 +1587,7 @@ class Integration(TimestampMixin, Base):
 
     id     = Column(String, primary_key=True, index=True)
     owner  = Column(String, nullable=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     name   = Column(String, nullable=False)
     type   = Column(String, nullable=False)  # "email", "rss", "webhook"
     config = Column(JSON, nullable=True)     # type-specific config
@@ -1585,6 +1690,7 @@ def init_db():
     _migrate_add_api_token_scopes_column()
     _migrate_backfill_document_owner_from_session()
     _migrate_assign_legacy_owner()
+    backfill_owner_ids(engine)
     _migrate_add_tidy_verdict()
     _migrate_add_doc_source_email_cols()
     _migrate_add_oauth_config()

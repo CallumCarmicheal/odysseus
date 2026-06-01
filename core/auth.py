@@ -134,7 +134,7 @@ class AuthManager:
         return users if isinstance(users, dict) else {}
 
     def _migrate_legacy_files(self) -> None:
-        from core.database import AuthSetting, User, UserSession
+        from core.database import AuthSetting, User, UserSession, backfill_owner_ids
 
         legacy_auth = self._load_legacy_auth()
         legacy_users = self._legacy_users(legacy_auth)
@@ -189,6 +189,7 @@ class AuthManager:
             db.commit()
             if imported_users:
                 logger.info("Imported %d legacy auth user(s) into app.db", imported_users)
+            backfill_owner_ids(db.get_bind())
 
             imported_sessions = 0
             for token, raw_session in legacy_sessions.items():
