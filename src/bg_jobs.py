@@ -23,9 +23,11 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import sqlite3
 import subprocess
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -52,7 +54,20 @@ _MAX_OUTPUT_CHARS = 16000
 _RETENTION_S = 3600  # 1 hour after follow-up
 
 
-def _load() -> Dict[str, Dict[str, Any]]:
+def _sqlite_database_path_from_url() -> Optional[Path]:
+    try:
+        from core.database import DATABASE_URL
+    except Exception:
+        return None
+    if not str(DATABASE_URL).startswith("sqlite:///"):
+        return None
+    raw_path = str(DATABASE_URL).replace("sqlite:///", "", 1)
+    if raw_path in ("", ":memory:"):
+        return None
+    return Path(raw_path)
+
+
+def _load_legacy() -> Dict[str, Dict[str, Any]]:
     try:
         if _STORE.exists():
             return json.loads(_STORE.read_text(encoding="utf-8")) or {}
@@ -61,8 +76,93 @@ def _load() -> Dict[str, Dict[str, Any]]:
     return {}
 
 
-def _save(jobs: Dict[str, Dict[str, Any]]) -> None:
+def _save_legacy(jobs: Dict[str, Dict[str, Any]]) -> None:
     atomic_write_json(str(_STORE), jobs, indent=2)
+
+
+def _connect_store():
+    db_path = _sqlite_database_path_from_url()
+    if db_path is None:
+        return None
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS background_jobs (
+            id TEXT PRIMARY KEY,
+            record TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    legacy = _load_legacy()
+    if legacy:
+        now = datetime.utcnow().isoformat()
+        for job_id, record in legacy.items():
+            if not isinstance(record, dict):
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO background_jobs (id, record, updated_at) VALUES (?, ?, ?)",
+                (str(job_id), json.dumps(record), now),
+            )
+    return conn
+
+
+def _load_db() -> Dict[str, Dict[str, Any]]:
+    conn = _connect_store()
+    if conn is None:
+        return _load_legacy()
+    try:
+        rows = conn.execute("SELECT id, record FROM background_jobs").fetchall()
+        jobs: Dict[str, Dict[str, Any]] = {}
+        for job_id, raw in rows:
+            try:
+                record = json.loads(raw or "{}")
+            except Exception:
+                continue
+            if isinstance(record, dict):
+                jobs[str(job_id)] = record
+        conn.commit()
+        return jobs
+    finally:
+        conn.close()
+
+
+def _save_db(jobs: Dict[str, Dict[str, Any]]) -> None:
+    conn = _connect_store()
+    if conn is None:
+        _save_legacy(jobs)
+        return
+    try:
+        desired = {str(job_id) for job_id in (jobs or {})}
+        for (job_id,) in conn.execute("SELECT id FROM background_jobs").fetchall():
+            if job_id not in desired:
+                conn.execute("DELETE FROM background_jobs WHERE id=?", (job_id,))
+        now = datetime.utcnow().isoformat()
+        for job_id, record in (jobs or {}).items():
+            conn.execute(
+                """
+                INSERT INTO background_jobs (id, record, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET record=excluded.record, updated_at=excluded.updated_at
+                """,
+                (str(job_id), json.dumps(record), now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _load() -> Dict[str, Dict[str, Any]]:
+    try:
+        return _load_db()
+    except Exception:
+        return _load_legacy()
+
+
+def _save(jobs: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        _save_db(jobs)
+    except Exception:
+        _save_legacy(jobs)
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
