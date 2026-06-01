@@ -3872,14 +3872,8 @@ async def do_manage_contact(content: str, owner: Optional[str] = None) -> Dict:
 
 def _load_vault_config() -> Dict:
     """Load Vaultwarden config from data/vault.json."""
-    from pathlib import Path
-    p = Path("data/vault.json")
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
+    from src.vault_config import load_vault_config
+    return load_vault_config()
 
 
 async def _run_bw(args: list, session: Optional[str] = None, input_text: Optional[str] = None) -> tuple:
@@ -4024,22 +4018,13 @@ async def do_vault_unlock(content: str, owner: Optional[str] = None) -> Dict:
         return {"error": "bw returned empty session", "exit_code": 1}
 
     # Save session to vault.json
-    from pathlib import Path
-    p = Path("data/vault.json")
-    cfg = {}
-    if p.exists():
-        try:
-            cfg = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+    # The shared vault config helper now stores this in app.db first, with the
+    # legacy JSON file retained as DB-unavailable fallback.
+    from src.vault_config import load_vault_config, save_vault_config
+    cfg = load_vault_config()
     cfg["session"] = session
     from datetime import datetime as _dt
     cfg["unlocked_at"] = _dt.utcnow().isoformat()
-    p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    try:
-        import os as _os
-        _os.chmod(str(p), 0o600)
-    except Exception:
-        pass
+    save_vault_config(cfg)
 
     return {"output": "Vault unlocked. Session saved.", "exit_code": 0}

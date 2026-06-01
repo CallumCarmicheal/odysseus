@@ -17,10 +17,9 @@ from pydantic import BaseModel
 
 from core.middleware import require_admin
 from core.platform_compat import IS_WINDOWS, safe_chmod, which_tool
+from src.vault_config import VAULT_FILE, load_vault_config, save_vault_config
 
 logger = logging.getLogger(__name__)
-
-VAULT_FILE = Path("data/vault.json")
 
 
 def _find_bw() -> str:
@@ -59,20 +58,14 @@ def _find_bw() -> str:
 
 
 def _load_config() -> dict:
-    if VAULT_FILE.exists():
-        try:
-            return json.loads(VAULT_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
+    return load_vault_config()
 
 
 def _save_config(cfg: dict):
-    VAULT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    VAULT_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     # POSIX: restrict the BW_SESSION store to 0o600. Windows: no-op (profile dir
     # is ACL-restricted already).
-    safe_chmod(str(VAULT_FILE), 0o600)
+    # The shared helper applies this on JSON fallback.
+    save_vault_config(cfg)
 
 
 async def _run_bw(args: list, session: str = None, input_text: str = None) -> tuple:
