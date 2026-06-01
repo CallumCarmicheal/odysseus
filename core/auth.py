@@ -1,4 +1,5 @@
-"""Database-backed authentication manager.
+"""
+Authentication module — multi-user password hashing, session tokens, config persistence.
 
 Legacy ``data/auth.json`` and ``data/sessions.json`` are imported on startup
 for existing deployments. Runtime auth state is stored in ``app.db``.
@@ -38,6 +39,7 @@ DEFAULT_PRIVILEGES = {
     "allowed_models": [],
 }
 
+# Admins get everything
 ADMIN_PRIVILEGES = {
     key: (True if isinstance(value, bool) else (0 if isinstance(value, int) else []))
     for key, value in DEFAULT_PRIVILEGES.items()
@@ -73,7 +75,11 @@ class AuthManager:
         self.auth_path = auth_path
         self._sessions_path = os.path.join(os.path.dirname(auth_path), "sessions.json")
         self._session_factory = session_factory or self._default_session_factory()
+        # Guards mutations of persisted user_sessions rows.
+        # Validate/create/revoke run concurrently from the FastAPI threadpool.
         self._sessions_lock = threading.RLock()
+        # Guards the first-run setup check-and-write so concurrent requests
+        # cannot both observe is_configured==False and both create admin accounts.
         self._setup_lock = threading.Lock()
         self._migrate_legacy_files()
 
@@ -91,6 +97,7 @@ class AuthManager:
     # ------------------------------------------------------------------
 
     def _load_legacy_auth(self) -> dict:
+        """Load legacy auth config from disk for one-way import."""
         try:
             if os.path.exists(self.auth_path):
                 with open(self.auth_path, "r", encoding="utf-8") as f:
@@ -101,6 +108,7 @@ class AuthManager:
         return {}
 
     def _load_legacy_sessions(self) -> dict:
+        """Load persisted legacy session tokens from disk; expired ones are pruned on import."""
         try:
             if os.path.exists(self._sessions_path):
                 with open(self._sessions_path, "r", encoding="utf-8") as f:
@@ -111,6 +119,7 @@ class AuthManager:
         return {}
 
     def _legacy_users(self, config: dict) -> dict:
+        """Migrate old single-user format into the multi-user import shape."""
         if "password_hash" in config and "users" not in config:
             username = normalize_username(config.get("username") or "admin") or "admin"
             return {
@@ -140,6 +149,7 @@ class AuthManager:
                 if not username or not isinstance(raw_user, dict):
                     continue
                 existing = db.query(User).filter(User.username == username).first()
+                # Normalize setup.py's old role='admin' marker to is_admin=True.
                 is_admin = bool(raw_user.get("is_admin") or raw_user.get("role") == "admin")
                 privileges = raw_user.get("privileges")
                 if not isinstance(privileges, dict):
@@ -310,6 +320,7 @@ class AuthManager:
             return self.create_user(username, password, is_admin=True)
 
     def create_user(self, username: str, password: str, is_admin: bool = False) -> bool:
+        """Create a new user account."""
         from core.database import User
 
         username = normalize_username(username)
@@ -337,6 +348,13 @@ class AuthManager:
             db.close()
 
     def delete_user(self, username: str, requesting_user: str) -> bool:
+        """Delete a user. Only admins can delete, and can't delete themselves.
+
+        SECURITY: also revoke every active session token belonging to this
+        user so any open browser tab they have gets kicked back to /login
+        on the next request. Without this the user kept full access until
+        their cookie expired naturally (default ~30 days).
+        """
         from core.database import User, UserSession
 
         username = normalize_username(username)
@@ -350,6 +368,9 @@ class AuthManager:
             target = self._get_user(db, username)
             if requester is None or target is None or not requester.is_admin:
                 return False
+            # Purge all sessions belonging to this user. validate_token also
+            # cross-checks the user relationship, but deleting eagerly kicks
+            # open browser tabs out on their next request.
             db.query(UserSession).filter(UserSession.user_id == target.id).delete(synchronize_session=False)
             db.delete(target)
             db.commit()
@@ -363,6 +384,11 @@ class AuthManager:
             db.close()
 
     def rename_user(self, old_username: str, new_username: str, requesting_user: str) -> bool:
+        """Rename a user in auth storage. Admin only.
+
+        Active sessions are tied to users.id, so they follow the renamed
+        account without rewriting token records.
+        """
         from core.database import User
 
         old_username = normalize_username(old_username)
@@ -406,6 +432,7 @@ class AuthManager:
         ]
 
     def get_privileges(self, username: str) -> Dict[str, Any]:
+        """Get privileges for a user. Admins get all privileges."""
         db = self._db()
         try:
             user = self._get_user(db, username)
@@ -413,19 +440,22 @@ class AuthManager:
                 return dict(DEFAULT_PRIVILEGES)
             if user.is_admin:
                 return dict(ADMIN_PRIVILEGES)
+            # Merge stored privileges with defaults (in case new privileges were added)
             stored = user.privileges or {}
             return {**DEFAULT_PRIVILEGES, **stored}
         finally:
             db.close()
 
     def set_privileges(self, username: str, privileges: Dict[str, Any]) -> bool:
+        """Update privileges for a user. Can't modify admin privileges."""
         username = normalize_username(username)
         db = self._db()
         try:
             user = self._get_user(db, username)
             if user is None or user.is_admin:
-                return False
+                return False  # admins always have full access
             current = self.get_privileges(username)
+            # Only allow known privilege keys
             for key, value in privileges.items():
                 if key in DEFAULT_PRIVILEGES:
                     current[key] = value
@@ -464,6 +494,7 @@ class AuthManager:
     # ------------------------------------------------------------------
 
     def totp_enabled(self, username: str) -> bool:
+        """Check if 2FA is enabled for a user."""
         db = self._db()
         try:
             user = self._get_user(db, username)
@@ -472,6 +503,7 @@ class AuthManager:
             db.close()
 
     def totp_generate_secret(self, username: str) -> Optional[str]:
+        """Generate a new TOTP secret for a user. Returns the secret (not yet enabled)."""
         username = normalize_username(username)
         db = self._db()
         try:
@@ -491,9 +523,11 @@ class AuthManager:
             db.close()
 
     def totp_get_provisioning_uri(self, username: str, secret: str) -> str:
+        """Get the otpauth:// URI for QR code generation."""
         return pyotp.TOTP(secret).provisioning_uri(name=normalize_username(username), issuer_name="Odysseus")
 
     def totp_confirm_enable(self, username: str, code: str) -> bool:
+        """Verify a TOTP code against the pending secret, then enable 2FA."""
         username = normalize_username(username)
         db = self._db()
         try:
@@ -502,10 +536,12 @@ class AuthManager:
                 return False
             if not pyotp.TOTP(user.totp_secret_pending).verify(code, valid_window=1):
                 return False
+            # Enable 2FA
             backup = [secrets.token_hex(4) for _ in range(8)]
             user.totp_secret = user.totp_secret_pending
             user.totp_secret_pending = None
             user.totp_enabled = True
+            # Generate backup codes
             user.totp_backup_codes = backup
             user.updated_at = datetime.utcnow()
             db.commit()
@@ -519,14 +555,16 @@ class AuthManager:
             db.close()
 
     def totp_verify(self, username: str, code: str) -> bool:
+        """Verify a TOTP code for login."""
         username = normalize_username(username)
         db = self._db()
         try:
             user = self._get_user(db, username)
             if user is None or not user.totp_enabled:
-                return True
+                return True  # 2FA not enabled, always pass
             if not user.totp_secret:
                 return True
+            # Check backup codes first
             backup = list(user.totp_backup_codes or [])
             if code in backup:
                 backup.remove(code)
@@ -544,6 +582,7 @@ class AuthManager:
             db.close()
 
     def totp_disable(self, username: str, password: str) -> bool:
+        """Disable 2FA for a user. Requires password confirmation."""
         username = normalize_username(username)
         if not self.verify_password(username, password):
             return False
@@ -580,6 +619,7 @@ class AuthManager:
             db.close()
 
     def create_session(self, username: str, password: str) -> Optional[str]:
+        """Verify credentials and return a session token, or None."""
         from core.database import UserSession
 
         username = normalize_username(username)
@@ -589,6 +629,7 @@ class AuthManager:
         expires_at = datetime.utcnow() + timedelta(seconds=TOKEN_TTL)
 
         with self._sessions_lock:
+            # Persist session tokens to app.db (atomic via commit, lock-guarded).
             db = self._db()
             try:
                 user = self._get_user(db, username)
@@ -620,6 +661,10 @@ class AuthManager:
                 if row is None:
                     return False
                 if row.expires_at <= datetime.utcnow() or row.user is None:
+                    # SECURITY: if the user record has since been removed
+                    # (admin deleted them while their cookie was still valid),
+                    # drop the session so the next request kicks them out
+                    # instead of silently authenticating a non-existent account.
                     db.delete(row)
                     db.commit()
                     return False
@@ -632,6 +677,7 @@ class AuthManager:
                 db.close()
 
     def get_username_for_token(self, token: Optional[str]) -> Optional[str]:
+        """Return the username associated with a valid token."""
         if not token:
             return None
         from core.database import UserSession
@@ -643,6 +689,7 @@ class AuthManager:
                 if row is None:
                     return None
                 if row.expires_at <= datetime.utcnow() or row.user is None:
+                    # SECURITY: orphan check — same rationale as validate_token.
                     db.delete(row)
                     db.commit()
                     return None

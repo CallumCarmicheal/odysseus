@@ -606,7 +606,7 @@ def test_internal_tool_owner_header_logic_requires_known_user():
 
 
 def test_auth_manager_migrates_legacy_admin_role(tmp_path):
-    """Old setup.py wrote role='admin'; startup must import it as admin."""
+    """Old setup.py wrote role='admin'; startup must turn that into DB is_admin."""
     import os
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
