@@ -1,24 +1,30 @@
-"""
-Authentication module — multi-user password hashing, session tokens, config persistence.
-Config stored in data/auth.json. Uses bcrypt directly.
+"""Database-backed authentication manager.
+
+Legacy ``data/auth.json`` and ``data/sessions.json`` are imported on startup
+for existing deployments. Runtime auth state is stored in ``app.db``.
 """
 
+from __future__ import annotations
+
+import hashlib
 import json
+import logging
 import os
 import secrets
 import threading
 import time
-import logging
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
 
 import bcrypt
 import pyotp
 
+from core.identity import normalize_username
+from core.public_ids import generate_public_id
+
 logger = logging.getLogger(__name__)
 
-
-from core.atomic_io import atomic_write_json as _atomic_write_json  # noqa: E402
 
 DEFAULT_PRIVILEGES = {
     "can_use_agent": True,
@@ -32,12 +38,12 @@ DEFAULT_PRIVILEGES = {
     "allowed_models": [],
 }
 
-# Admins get everything
-ADMIN_PRIVILEGES = {k: (True if isinstance(v, bool) else (0 if isinstance(v, int) else [])) for k, v in DEFAULT_PRIVILEGES.items()}
+ADMIN_PRIVILEGES = {
+    key: (True if isinstance(value, bool) else (0 if isinstance(value, int) else []))
+    for key, value in DEFAULT_PRIVILEGES.items()
+}
 
-DEFAULT_AUTH_PATH = os.path.join(
-    Path(__file__).parent.parent, "data", "auth.json"
-)
+DEFAULT_AUTH_PATH = os.path.join(Path(__file__).parent.parent, "data", "auth.json")
 TOKEN_TTL = 60 * 60 * 24 * 7  # 7 days
 
 
@@ -49,110 +55,248 @@ def _verify_password(password: str, hashed: str) -> bool:
     return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
 
 
-class AuthManager:
-    """Manages multi-user password + session-token auth system."""
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    def __init__(self, auth_path: str = DEFAULT_AUTH_PATH):
+
+def _timestamp_to_datetime(value: Any) -> datetime | None:
+    try:
+        return datetime.utcfromtimestamp(float(value))
+    except Exception:
+        return None
+
+
+class AuthManager:
+    """Manages multi-user password, privilege, TOTP, and session-token auth."""
+
+    def __init__(self, auth_path: str = DEFAULT_AUTH_PATH, session_factory=None):
         self.auth_path = auth_path
         self._sessions_path = os.path.join(os.path.dirname(auth_path), "sessions.json")
-        self._config: Dict[str, Any] = {}
-        self._sessions: Dict[str, Dict[str, Any]] = {}  # token -> {username, expiry}
-        # Guards mutations of self._sessions and the on-disk sessions.json.
-        # Validate/create/revoke run concurrently from the FastAPI threadpool.
+        self._session_factory = session_factory or self._default_session_factory()
         self._sessions_lock = threading.RLock()
-        # Guards the first-run setup check-and-write so concurrent requests
-        # cannot both observe is_configured==False and both create admin accounts.
         self._setup_lock = threading.Lock()
-        self._load()
-        self._load_sessions()
-        self._migrate_single_user()
-        self._migrate_legacy_admin_role()
+        self._migrate_legacy_files()
 
-    def _load(self):
+    @staticmethod
+    def _default_session_factory():
+        from core.database import SessionLocal
+
+        return SessionLocal
+
+    def _db(self):
+        return self._session_factory()
+
+    # ------------------------------------------------------------------
+    # Legacy import
+    # ------------------------------------------------------------------
+
+    def _load_legacy_auth(self) -> dict:
         try:
             if os.path.exists(self.auth_path):
                 with open(self.auth_path, "r", encoding="utf-8") as f:
-                    self._config = json.load(f)
-                logger.info("Auth config loaded")
-            else:
-                self._config = {}
-                logger.info("No auth config found — first-run setup required")
-        except Exception as e:
-            logger.error(f"Failed to load auth config: {e}")
-            self._config = {}
+                    data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            logger.error("Failed to load legacy auth config: %s", exc)
+        return {}
 
-    def _load_sessions(self):
-        """Load persisted session tokens from disk, pruning expired ones."""
+    def _load_legacy_sessions(self) -> dict:
         try:
             if os.path.exists(self._sessions_path):
                 with open(self._sessions_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                now = time.time()
-                self._sessions = {k: v for k, v in data.items() if v.get("expiry", 0) > now}
-                pruned = len(data) - len(self._sessions)
-                if pruned > 0:
-                    self._save_sessions()
-                logger.info(f"Loaded {len(self._sessions)} session(s) from disk")
-        except Exception as e:
-            logger.error(f"Failed to load sessions: {e}")
-            self._sessions = {}
+                return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            logger.error("Failed to load legacy sessions: %s", exc)
+        return {}
 
-    def _save_sessions(self):
-        """Persist session tokens to disk (atomic, lock-guarded)."""
-        try:
-            with self._sessions_lock:
-                snapshot = dict(self._sessions)
-            _atomic_write_json(self._sessions_path, snapshot)
-        except Exception as e:
-            logger.error(f"Failed to save sessions: {e}")
-
-    def _migrate_single_user(self):
-        """Migrate old single-user format to multi-user format."""
-        if "password_hash" in self._config and "users" not in self._config:
-            old_user = self._config.get("username", "admin")
-            old_hash = self._config["password_hash"]
-            self._config = {
-                "users": {
-                    old_user: {
-                        "password_hash": old_hash,
-                        "created": time.time(),
-                        "is_admin": True,
-                    }
+    def _legacy_users(self, config: dict) -> dict:
+        if "password_hash" in config and "users" not in config:
+            username = normalize_username(config.get("username") or "admin") or "admin"
+            return {
+                username: {
+                    "password_hash": config.get("password_hash", ""),
+                    "created": config.get("created", time.time()),
+                    "is_admin": True,
+                    "privileges": dict(ADMIN_PRIVILEGES),
                 }
             }
-            self._save()
-            logger.info(f"Migrated single-user auth to multi-user (admin: {old_user})")
+        users = config.get("users", {})
+        return users if isinstance(users, dict) else {}
 
-    def _migrate_legacy_admin_role(self):
-        """Normalize setup.py's old role='admin' marker to is_admin=True."""
-        changed = False
-        for username, user in self.users.items():
-            if user.get("role") == "admin" and "is_admin" not in user:
-                user["is_admin"] = True
-                changed = True
-                logger.info(f"Migrated legacy admin role for '{username}'")
-        if changed:
-            self._save()
+    def _migrate_legacy_files(self) -> None:
+        from core.database import AuthSetting, User, UserSession
 
-    def _save(self):
-        _atomic_write_json(self.auth_path, self._config, indent=2)
+        legacy_auth = self._load_legacy_auth()
+        legacy_users = self._legacy_users(legacy_auth)
+        legacy_sessions = self._load_legacy_sessions()
+        now_ts = time.time()
+
+        db = self._db()
+        try:
+            imported_users = 0
+            for raw_username, raw_user in legacy_users.items():
+                username = normalize_username(raw_username)
+                if not username or not isinstance(raw_user, dict):
+                    continue
+                existing = db.query(User).filter(User.username == username).first()
+                is_admin = bool(raw_user.get("is_admin") or raw_user.get("role") == "admin")
+                privileges = raw_user.get("privileges")
+                if not isinstance(privileges, dict):
+                    privileges = dict(ADMIN_PRIVILEGES if is_admin else DEFAULT_PRIVILEGES)
+                if existing is None:
+                    created_at = _timestamp_to_datetime(raw_user.get("created")) or datetime.utcnow()
+                    db.add(User(
+                        public_id=generate_public_id("user"),
+                        username=username,
+                        password_hash=raw_user.get("password_hash") or "",
+                        is_admin=is_admin,
+                        privileges=privileges,
+                        totp_enabled=bool(raw_user.get("totp_enabled")),
+                        totp_secret=raw_user.get("totp_secret"),
+                        totp_secret_pending=raw_user.get("totp_secret_pending"),
+                        totp_backup_codes=raw_user.get("totp_backup_codes") or [],
+                        created_at=created_at,
+                        updated_at=datetime.utcnow(),
+                    ))
+                    imported_users += 1
+                else:
+                    changed = False
+                    if is_admin and not existing.is_admin:
+                        existing.is_admin = True
+                        changed = True
+                    if not existing.privileges:
+                        existing.privileges = privileges
+                        changed = True
+                    if changed:
+                        existing.updated_at = datetime.utcnow()
+
+            if "signup_enabled" in legacy_auth:
+                setting = db.query(AuthSetting).filter(AuthSetting.key == "signup_enabled").first()
+                if setting is None:
+                    db.add(AuthSetting(key="signup_enabled", value=bool(legacy_auth.get("signup_enabled"))))
+
+            db.commit()
+            if imported_users:
+                logger.info("Imported %d legacy auth user(s) into app.db", imported_users)
+
+            imported_sessions = 0
+            for token, raw_session in legacy_sessions.items():
+                if not token or not isinstance(raw_session, dict):
+                    continue
+                expiry = float(raw_session.get("expiry") or 0)
+                if expiry <= now_ts:
+                    continue
+                username = normalize_username(raw_session.get("username"))
+                if not username:
+                    continue
+                user = db.query(User).filter(User.username == username).first()
+                if user is None:
+                    continue
+                token_hash = _hash_token(token)
+                existing = db.query(UserSession).filter(UserSession.token_hash == token_hash).first()
+                if existing is None:
+                    db.add(UserSession(
+                        token_hash=token_hash,
+                        user_id=user.id,
+                        expires_at=datetime.utcfromtimestamp(expiry),
+                    ))
+                    imported_sessions += 1
+            db.commit()
+            if imported_sessions:
+                logger.info("Imported %d legacy login session(s) into app.db", imported_sessions)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    # ------------------------------------------------------------------
+    # User serialization/settings
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _user_to_dict(user) -> dict:
+        return {
+            "password_hash": user.password_hash,
+            "created": user.created_at.timestamp() if user.created_at else 0,
+            "is_admin": bool(user.is_admin),
+            "privileges": dict(user.privileges or {}),
+            "totp_enabled": bool(user.totp_enabled),
+            "totp_secret": user.totp_secret,
+            "totp_secret_pending": user.totp_secret_pending,
+            "totp_backup_codes": list(user.totp_backup_codes or []),
+        }
+
+    def _get_user(self, db, username: str):
+        from core.database import User
+
+        username = normalize_username(username)
+        if not username:
+            return None
+        return db.query(User).filter(User.username == username).first()
 
     @property
     def users(self) -> Dict[str, Any]:
-        return self._config.get("users", {})
+        from core.database import User
+
+        db = self._db()
+        try:
+            rows = db.query(User).order_by(User.username).all()
+            return {row.username: self._user_to_dict(row) for row in rows}
+        finally:
+            db.close()
 
     @property
     def signup_enabled(self) -> bool:
-        return self._config.get("signup_enabled", False)
+        from core.database import AuthSetting
+
+        db = self._db()
+        try:
+            setting = db.query(AuthSetting).filter(AuthSetting.key == "signup_enabled").first()
+            return bool(setting.value) if setting is not None else False
+        finally:
+            db.close()
 
     @signup_enabled.setter
     def signup_enabled(self, value: bool):
-        self._config["signup_enabled"] = value
-        self._save()
+        from core.database import AuthSetting
+
+        db = self._db()
+        try:
+            setting = db.query(AuthSetting).filter(AuthSetting.key == "signup_enabled").first()
+            if setting is None:
+                db.add(AuthSetting(key="signup_enabled", value=bool(value)))
+            else:
+                setting.value = bool(value)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     @property
     def is_configured(self) -> bool:
-        return len(self.users) > 0
+        from core.database import User
+
+        db = self._db()
+        try:
+            return (db.query(User).count() or 0) > 0
+        finally:
+            db.close()
+
+    def primary_admin_username(self) -> Optional[str]:
+        from core.database import User
+
+        db = self._db()
+        try:
+            row = db.query(User).filter(User.is_admin == True).order_by(User.id).first()  # noqa: E712
+            if row is None:
+                row = db.query(User).order_by(User.id).first()
+            return row.username if row is not None else None
+        finally:
+            db.close()
 
     # ------------------------------------------------------------------
     # Account management
@@ -166,285 +310,365 @@ class AuthManager:
             return self.create_user(username, password, is_admin=True)
 
     def create_user(self, username: str, password: str, is_admin: bool = False) -> bool:
-        """Create a new user account."""
-        username = username.strip().lower()
-        if username in self.users:
+        from core.database import User
+
+        username = normalize_username(username)
+        if not username:
             return False
-        if "users" not in self._config:
-            self._config["users"] = {}
-        self._config["users"][username] = {
-            "password_hash": _hash_password(password),
-            "created": time.time(),
-            "is_admin": is_admin,
-            "privileges": dict(ADMIN_PRIVILEGES if is_admin else DEFAULT_PRIVILEGES),
-        }
-        self._save()
-        logger.info(f"Created user '{username}' (admin={is_admin})")
-        return True
+        db = self._db()
+        try:
+            if db.query(User).filter(User.username == username).first() is not None:
+                return False
+            db.add(User(
+                public_id=generate_public_id("user"),
+                username=username,
+                password_hash=_hash_password(password),
+                is_admin=bool(is_admin),
+                privileges=dict(ADMIN_PRIVILEGES if is_admin else DEFAULT_PRIVILEGES),
+            ))
+            db.commit()
+            logger.info("Created user '%s' (admin=%s)", username, is_admin)
+            return True
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to create user '%s'", username)
+            return False
+        finally:
+            db.close()
 
     def delete_user(self, username: str, requesting_user: str) -> bool:
-        """Delete a user. Only admins can delete, and can't delete themselves.
+        from core.database import User, UserSession
 
-        SECURITY: also revoke every active session token belonging to this
-        user so any open browser tab they have gets kicked back to /login
-        on the next request. Without this the user kept full access until
-        their cookie expired naturally (default ~30 days).
-        """
-        username = username.strip().lower()
-        if username not in self.users:
+        username = normalize_username(username)
+        requesting_user = normalize_username(requesting_user)
+        if not username or username == requesting_user:
             return False
-        if username == requesting_user:
+
+        db = self._db()
+        try:
+            requester = self._get_user(db, requesting_user)
+            target = self._get_user(db, username)
+            if requester is None or target is None or not requester.is_admin:
+                return False
+            db.query(UserSession).filter(UserSession.user_id == target.id).delete(synchronize_session=False)
+            db.delete(target)
+            db.commit()
+            logger.info("Deleted user '%s' (by %s)", username, requesting_user)
+            return True
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to delete user '%s'", username)
             return False
-        if not self.users.get(requesting_user, {}).get("is_admin"):
-            return False
-        del self._config["users"][username]
-        self._save()
-        # Purge all sessions belonging to this user. validate_token doesn't
-        # cross-check `self.users`, so without this step a deleted user's
-        # cookie keeps authenticating.
-        revoked = 0
-        with self._sessions_lock:
-            to_drop = [tok for tok, sess in self._sessions.items()
-                       if (sess or {}).get("username") == username]
-            for tok in to_drop:
-                self._sessions.pop(tok, None)
-                revoked += 1
-        if revoked:
-            self._save_sessions()
-        logger.info(f"Deleted user '{username}' (by {requesting_user}); revoked {revoked} active session(s)")
-        return True
+        finally:
+            db.close()
 
     def rename_user(self, old_username: str, new_username: str, requesting_user: str) -> bool:
-        """Rename a user in auth config and active sessions. Admin only."""
-        old_username = old_username.strip().lower()
-        new_username = new_username.strip().lower()
-        requesting_user = (requesting_user or "").strip().lower()
+        from core.database import User
+
+        old_username = normalize_username(old_username)
+        new_username = normalize_username(new_username)
+        requesting_user = normalize_username(requesting_user)
         if not old_username or not new_username:
             return False
-        if old_username not in self.users:
-            return False
-        if new_username in self.users:
-            return False
-        if not self.users.get(requesting_user, {}).get("is_admin"):
-            return False
-        self._config.setdefault("users", {})[new_username] = self._config["users"].pop(old_username)
-        self._save()
 
-        renamed_sessions = 0
-        with self._sessions_lock:
-            for sess in self._sessions.values():
-                if (sess or {}).get("username") == old_username:
-                    sess["username"] = new_username
-                    renamed_sessions += 1
-        if renamed_sessions:
-            self._save_sessions()
-        logger.info(
-            "Renamed user '%s' -> '%s' (by %s); updated %d active session(s)",
-            old_username, new_username, requesting_user, renamed_sessions,
-        )
-        return True
+        db = self._db()
+        try:
+            requester = self._get_user(db, requesting_user)
+            target = self._get_user(db, old_username)
+            if requester is None or target is None or not requester.is_admin:
+                return False
+            if db.query(User).filter(User.username == new_username).first() is not None:
+                return False
+            target.username = new_username
+            target.updated_at = datetime.utcnow()
+            db.commit()
+            logger.info("Renamed user '%s' -> '%s' (by %s)", old_username, new_username, requesting_user)
+            return True
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to rename user '%s'", old_username)
+            return False
+        finally:
+            db.close()
 
     def is_admin(self, username: str) -> bool:
-        return self.users.get(username, {}).get("is_admin", False)
+        db = self._db()
+        try:
+            user = self._get_user(db, username)
+            return bool(user and user.is_admin)
+        finally:
+            db.close()
 
     def list_users(self) -> List[Dict[str, Any]]:
         return [
-            {"username": u, "is_admin": d.get("is_admin", False), "privileges": self.get_privileges(u)}
-            for u, d in self.users.items()
+            {"username": username, "is_admin": data.get("is_admin", False), "privileges": self.get_privileges(username)}
+            for username, data in self.users.items()
         ]
 
     def get_privileges(self, username: str) -> Dict[str, Any]:
-        """Get privileges for a user. Admins get all privileges."""
-        user = self.users.get(username, {})
-        if user.get("is_admin"):
-            return dict(ADMIN_PRIVILEGES)
-        # Merge stored privileges with defaults (in case new privileges were added)
-        stored = user.get("privileges", {})
-        return {**DEFAULT_PRIVILEGES, **stored}
+        db = self._db()
+        try:
+            user = self._get_user(db, username)
+            if user is None:
+                return dict(DEFAULT_PRIVILEGES)
+            if user.is_admin:
+                return dict(ADMIN_PRIVILEGES)
+            stored = user.privileges or {}
+            return {**DEFAULT_PRIVILEGES, **stored}
+        finally:
+            db.close()
 
     def set_privileges(self, username: str, privileges: Dict[str, Any]) -> bool:
-        """Update privileges for a user. Can't modify admin privileges."""
-        username = username.strip().lower()
-        if username not in self.users:
+        username = normalize_username(username)
+        db = self._db()
+        try:
+            user = self._get_user(db, username)
+            if user is None or user.is_admin:
+                return False
+            current = self.get_privileges(username)
+            for key, value in privileges.items():
+                if key in DEFAULT_PRIVILEGES:
+                    current[key] = value
+            user.privileges = current
+            user.updated_at = datetime.utcnow()
+            db.commit()
+            logger.info("Updated privileges for '%s': %s", username, current)
+            return True
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to update privileges for '%s'", username)
             return False
-        if self.users[username].get("is_admin"):
-            return False  # admins always have full access
-        # Only allow known privilege keys
-        current = self.get_privileges(username)
-        for k, v in privileges.items():
-            if k in DEFAULT_PRIVILEGES:
-                current[k] = v
-        self._config["users"][username]["privileges"] = current
-        self._save()
-        logger.info(f"Updated privileges for '{username}': {current}")
-        return True
+        finally:
+            db.close()
 
     def change_password(self, username: str, current_password: str, new_password: str) -> bool:
-        username = username.strip().lower()
-        if username not in self.users:
+        username = normalize_username(username)
+        db = self._db()
+        try:
+            user = self._get_user(db, username)
+            if user is None or not _verify_password(current_password, user.password_hash):
+                return False
+            user.password_hash = _hash_password(new_password)
+            user.updated_at = datetime.utcnow()
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to change password for '%s'", username)
             return False
-        if not _verify_password(current_password, self.users[username]["password_hash"]):
-            return False
-        self._config["users"][username]["password_hash"] = _hash_password(new_password)
-        self._save()
-        return True
+        finally:
+            db.close()
 
     # ------------------------------------------------------------------
     # TOTP two-factor authentication
     # ------------------------------------------------------------------
 
     def totp_enabled(self, username: str) -> bool:
-        """Check if 2FA is enabled for a user."""
-        user = self.users.get(username.strip().lower(), {})
-        return bool(user.get("totp_enabled"))
+        db = self._db()
+        try:
+            user = self._get_user(db, username)
+            return bool(user and user.totp_enabled)
+        finally:
+            db.close()
 
     def totp_generate_secret(self, username: str) -> Optional[str]:
-        """Generate a new TOTP secret for a user. Returns the secret (not yet enabled)."""
-        username = username.strip().lower()
-        if username not in self.users:
+        username = normalize_username(username)
+        db = self._db()
+        try:
+            user = self._get_user(db, username)
+            if user is None:
+                return None
+            secret = pyotp.random_base32()
+            user.totp_secret_pending = secret
+            user.updated_at = datetime.utcnow()
+            db.commit()
+            return secret
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to generate TOTP secret for '%s'", username)
             return None
-        secret = pyotp.random_base32()
-        self._config["users"][username]["totp_secret_pending"] = secret
-        self._save()
-        return secret
+        finally:
+            db.close()
 
     def totp_get_provisioning_uri(self, username: str, secret: str) -> str:
-        """Get the otpauth:// URI for QR code generation."""
-        totp = pyotp.TOTP(secret)
-        return totp.provisioning_uri(name=username, issuer_name="Odysseus")
+        return pyotp.TOTP(secret).provisioning_uri(name=normalize_username(username), issuer_name="Odysseus")
 
     def totp_confirm_enable(self, username: str, code: str) -> bool:
-        """Verify a TOTP code against the pending secret, then enable 2FA."""
-        username = username.strip().lower()
-        user = self.users.get(username, {})
-        secret = user.get("totp_secret_pending")
-        if not secret:
+        username = normalize_username(username)
+        db = self._db()
+        try:
+            user = self._get_user(db, username)
+            if user is None or not user.totp_secret_pending:
+                return False
+            if not pyotp.TOTP(user.totp_secret_pending).verify(code, valid_window=1):
+                return False
+            backup = [secrets.token_hex(4) for _ in range(8)]
+            user.totp_secret = user.totp_secret_pending
+            user.totp_secret_pending = None
+            user.totp_enabled = True
+            user.totp_backup_codes = backup
+            user.updated_at = datetime.utcnow()
+            db.commit()
+            logger.info("2FA enabled for '%s'", username)
+            return True
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to confirm TOTP for '%s'", username)
             return False
-        totp = pyotp.TOTP(secret)
-        if not totp.verify(code, valid_window=1):
-            return False
-        # Enable 2FA
-        self._config["users"][username]["totp_secret"] = secret
-        self._config["users"][username]["totp_enabled"] = True
-        self._config["users"][username].pop("totp_secret_pending", None)
-        # Generate backup codes
-        backup = [secrets.token_hex(4) for _ in range(8)]
-        self._config["users"][username]["totp_backup_codes"] = backup
-        self._save()
-        logger.info(f"2FA enabled for '{username}'")
-        return True
+        finally:
+            db.close()
 
     def totp_verify(self, username: str, code: str) -> bool:
-        """Verify a TOTP code for login."""
-        username = username.strip().lower()
-        user = self.users.get(username, {})
-        if not user.get("totp_enabled"):
-            return True  # 2FA not enabled, always pass
-        secret = user.get("totp_secret")
-        if not secret:
-            return True
-        # Check backup codes first
-        backup = user.get("totp_backup_codes", [])
-        if code in backup:
-            backup.remove(code)
-            self._config["users"][username]["totp_backup_codes"] = backup
-            self._save()
-            logger.info(f"Backup code used for '{username}' ({len(backup)} remaining)")
-            return True
-        totp = pyotp.TOTP(secret)
-        return totp.verify(code, valid_window=1)
+        username = normalize_username(username)
+        db = self._db()
+        try:
+            user = self._get_user(db, username)
+            if user is None or not user.totp_enabled:
+                return True
+            if not user.totp_secret:
+                return True
+            backup = list(user.totp_backup_codes or [])
+            if code in backup:
+                backup.remove(code)
+                user.totp_backup_codes = backup
+                user.updated_at = datetime.utcnow()
+                db.commit()
+                logger.info("Backup code used for '%s' (%d remaining)", username, len(backup))
+                return True
+            return pyotp.TOTP(user.totp_secret).verify(code, valid_window=1)
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to verify TOTP for '%s'", username)
+            return False
+        finally:
+            db.close()
 
     def totp_disable(self, username: str, password: str) -> bool:
-        """Disable 2FA for a user. Requires password confirmation."""
-        username = username.strip().lower()
+        username = normalize_username(username)
         if not self.verify_password(username, password):
             return False
-        self._config["users"][username].pop("totp_secret", None)
-        self._config["users"][username].pop("totp_secret_pending", None)
-        self._config["users"][username].pop("totp_backup_codes", None)
-        self._config["users"][username]["totp_enabled"] = False
-        self._save()
-        logger.info(f"2FA disabled for '{username}'")
-        return True
+        db = self._db()
+        try:
+            user = self._get_user(db, username)
+            if user is None:
+                return False
+            user.totp_secret = None
+            user.totp_secret_pending = None
+            user.totp_backup_codes = []
+            user.totp_enabled = False
+            user.updated_at = datetime.utcnow()
+            db.commit()
+            logger.info("2FA disabled for '%s'", username)
+            return True
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to disable TOTP for '%s'", username)
+            return False
+        finally:
+            db.close()
 
     # ------------------------------------------------------------------
     # Login / logout / session tokens
     # ------------------------------------------------------------------
 
     def verify_password(self, username: str, password: str) -> bool:
-        username = username.strip().lower()
-        if username not in self.users:
-            return False
-        return _verify_password(password, self.users[username]["password_hash"])
+        db = self._db()
+        try:
+            user = self._get_user(db, username)
+            return bool(user and _verify_password(password, user.password_hash))
+        finally:
+            db.close()
 
     def create_session(self, username: str, password: str) -> Optional[str]:
-        """Verify credentials and return a session token, or None."""
-        username = username.strip().lower()
+        from core.database import UserSession
+
+        username = normalize_username(username)
         if not self.verify_password(username, password):
             return None
         token = secrets.token_hex(32)
+        expires_at = datetime.utcnow() + timedelta(seconds=TOKEN_TTL)
+
         with self._sessions_lock:
-            self._sessions[token] = {
-                "username": username,
-                "expiry": time.time() + TOKEN_TTL,
-            }
-        self._save_sessions()
-        return token
+            db = self._db()
+            try:
+                user = self._get_user(db, username)
+                if user is None:
+                    return None
+                db.add(UserSession(
+                    token_hash=_hash_token(token),
+                    user_id=user.id,
+                    expires_at=expires_at,
+                ))
+                db.commit()
+                return token
+            except Exception:
+                db.rollback()
+                logger.exception("Failed to create session for '%s'", username)
+                return None
+            finally:
+                db.close()
 
     def validate_token(self, token: Optional[str]) -> bool:
         if not token:
             return False
-        expired = False
-        deleted_user = False
+        from core.database import UserSession
+
         with self._sessions_lock:
-            session = self._sessions.get(token)
-            if session is None:
+            db = self._db()
+            try:
+                row = db.query(UserSession).filter(UserSession.token_hash == _hash_token(token)).first()
+                if row is None:
+                    return False
+                if row.expires_at <= datetime.utcnow() or row.user is None:
+                    db.delete(row)
+                    db.commit()
+                    return False
+                return True
+            except Exception:
+                db.rollback()
+                logger.exception("Failed to validate auth token")
                 return False
-            if time.time() > session["expiry"]:
-                self._sessions.pop(token, None)
-                expired = True
-            else:
-                # SECURITY: if the user record has since been removed (admin
-                # deleted them while their cookie was still valid), drop the
-                # session so the next request kicks them out instead of
-                # silently authenticating against a non-existent account.
-                if session.get("username") not in self.users:
-                    self._sessions.pop(token, None)
-                    deleted_user = True
-        if expired or deleted_user:
-            self._save_sessions()
-            return False
-        return True
+            finally:
+                db.close()
 
     def get_username_for_token(self, token: Optional[str]) -> Optional[str]:
-        """Return the username associated with a valid token."""
         if not token:
             return None
-        expired = False
-        deleted_user = False
+        from core.database import UserSession
+
         with self._sessions_lock:
-            session = self._sessions.get(token)
-            if session is None:
+            db = self._db()
+            try:
+                row = db.query(UserSession).filter(UserSession.token_hash == _hash_token(token)).first()
+                if row is None:
+                    return None
+                if row.expires_at <= datetime.utcnow() or row.user is None:
+                    db.delete(row)
+                    db.commit()
+                    return None
+                return row.user.username
+            except Exception:
+                db.rollback()
+                logger.exception("Failed to resolve auth token")
                 return None
-            if time.time() > session["expiry"]:
-                self._sessions.pop(token, None)
-                expired = True
-            else:
-                _u = session["username"]
-                # SECURITY: orphan check — same rationale as validate_token.
-                if _u not in self.users:
-                    self._sessions.pop(token, None)
-                    deleted_user = True
-                else:
-                    return _u
-        if expired or deleted_user:
-            self._save_sessions()
-        return None
+            finally:
+                db.close()
 
     def revoke_token(self, token: str):
+        if not token:
+            return
+        from core.database import UserSession
+
         with self._sessions_lock:
-            self._sessions.pop(token, None)
-        self._save_sessions()
+            db = self._db()
+            try:
+                db.query(UserSession).filter(UserSession.token_hash == _hash_token(token)).delete(synchronize_session=False)
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("Failed to revoke auth token")
+            finally:
+                db.close()
 
     def status(self, token: Optional[str]) -> Dict[str, Any]:
         username = self.get_username_for_token(token)

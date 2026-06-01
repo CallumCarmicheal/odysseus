@@ -606,11 +606,17 @@ def test_internal_tool_owner_header_logic_requires_known_user():
 
 
 def test_auth_manager_migrates_legacy_admin_role(tmp_path):
-    """Old setup.py wrote role='admin'; startup must turn that into is_admin."""
+    """Old setup.py wrote role='admin'; startup must import it as admin."""
+    import os
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    os.environ["DATABASE_URL"] = "sqlite:///:memory:"
     sys.modules.pop("core.auth", None)
     if "core" in sys.modules and hasattr(sys.modules["core"], "auth"):
         delattr(sys.modules["core"], "auth")
     from core.auth import AuthManager
+    from core.database import Base, User
 
     auth_path = tmp_path / "auth.json"
     auth_path.write_text(json.dumps({
@@ -622,11 +628,20 @@ def test_auth_manager_migrates_legacy_admin_role(tmp_path):
         }
     }))
 
-    mgr = AuthManager(str(auth_path))
+    engine = create_engine(f"sqlite:///{tmp_path / 'app.db'}")
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    mgr = AuthManager(str(auth_path), session_factory=session_factory)
 
     assert mgr.is_admin("admin") is True
-    data = json.loads(auth_path.read_text())
-    assert data["users"]["admin"]["is_admin"] is True
+    db = session_factory()
+    try:
+        user = db.query(User).filter(User.username == "admin").first()
+        assert user is not None
+        assert user.is_admin is True
+    finally:
+        db.close()
 
 
 def _load_search_content_for_test(monkeypatch, name="services.search.content_under_test"):

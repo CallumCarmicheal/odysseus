@@ -861,11 +861,7 @@ async def startup_event():
         # Create/reconcile default automation tasks + personal assistant for every user.
         owners = set()
         try:
-            import json as _json
-            auth_path = "data/auth.json"
-            with open(auth_path, encoding="utf-8") as f:
-                users = _json.load(f).get("users", {})
-            owners.update(users.keys())
+            owners.update(auth_manager.users.keys())
         except Exception as e:
             logger.debug(f"Default task auth-owner scan: {e}")
 
@@ -908,17 +904,8 @@ async def startup_event():
     # ownerless or deleted/test-owner SKILL.md files so strict owner filtering
     # does not make an existing library look empty after auth/account changes.
     try:
-        import json as _json
-        auth_path = "data/auth.json"
-        with open(auth_path, encoding="utf-8") as f:
-            users = _json.load(f).get("users", {})
-        primary_owner = None
-        for uname, udata in users.items():
-            if udata.get("is_admin") is True:
-                primary_owner = uname
-                break
-        if not primary_owner and users:
-            primary_owner = next(iter(users))
+        users = auth_manager.users
+        primary_owner = auth_manager.primary_admin_username()
         if primary_owner:
             changed = skills_manager.backfill_owner(primary_owner, set(users.keys()))
             if changed:

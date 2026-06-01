@@ -60,6 +60,48 @@ class EncryptedText(TypeDecorator):
         return decrypt(value)
 
 
+class User(TimestampMixin, Base):
+    """Application user account.
+
+    ``username`` remains the human-facing login name; ``id`` is the durable
+    ownership key introduced by the storage migration.
+    """
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    public_id = Column(String, nullable=False, unique=True, index=True)
+    username = Column(String, nullable=False, unique=True, index=True)
+    password_hash = Column(String, nullable=False)
+    is_admin = Column(Boolean, default=False, nullable=False)
+    privileges = Column(JSON, nullable=True)
+    totp_enabled = Column(Boolean, default=False, nullable=False)
+    totp_secret = Column(String, nullable=True)
+    totp_secret_pending = Column(String, nullable=True)
+    totp_backup_codes = Column(JSON, nullable=True)
+
+    auth_sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
+
+
+class UserSession(TimestampMixin, Base):
+    """Persisted login session token, keyed by token hash."""
+    __tablename__ = "user_sessions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+
+    user = relationship("User", back_populates="auth_sessions")
+
+
+class AuthSetting(Base):
+    """Small auth-specific key/value settings, such as signup_enabled."""
+    __tablename__ = "auth_settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(JSON, nullable=True)
+
+
 class Session(TimestampMixin, Base):
     """
     SQLAlchemy model for Session table.
@@ -989,31 +1031,46 @@ def _migrate_assign_legacy_owner():
     import sqlite3
     import json as _json
 
-    # Find admin user from auth.json. The auth schema uses `is_admin: True`,
-    # not `role: "admin"` — old code looked for the wrong field and silently
-    # fell through to "first user" every time.
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+
+    # Prefer the DB-backed users table. Fall back to auth.json for deployments
+    # that have not completed the auth import yet.
+    admin_user = None
+    if os.path.exists(db_path):
+        try:
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT username FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1"
+            ).fetchone()
+            if row is None:
+                row = conn.execute("SELECT username FROM users ORDER BY id LIMIT 1").fetchone()
+            if row:
+                admin_user = row[0]
+            conn.close()
+        except Exception:
+            pass
+
     auth_path = os.path.join(os.path.dirname(DATABASE_URL.replace("sqlite:///", "")), "auth.json")
     if not os.path.isabs(auth_path):
         auth_path = os.path.join("data", "auth.json")
-    admin_user = None
-    try:
-        with open(auth_path, "r", encoding="utf-8") as f:
-            auth_data = _json.load(f)
-        users = auth_data.get("users", {})
-        if users:
-            for uname, udata in users.items():
-                if udata.get("is_admin") is True:
-                    admin_user = uname
-                    break
-            if not admin_user:
-                admin_user = next(iter(users))
-    except Exception:
-        pass
+    if not admin_user:
+        try:
+            with open(auth_path, "r", encoding="utf-8") as f:
+                auth_data = _json.load(f)
+            users = auth_data.get("users", {})
+            if users:
+                for uname, udata in users.items():
+                    if udata.get("is_admin") is True:
+                        admin_user = uname
+                        break
+                if not admin_user:
+                    admin_user = next(iter(users))
+        except Exception:
+            pass
 
     if not admin_user:
         return
 
-    db_path = DATABASE_URL.replace("sqlite:///", "")
     if not os.path.exists(db_path):
         return
 
