@@ -266,7 +266,89 @@ ATTACHMENTS_DIR = Path(os.environ.get("ODYSSEUS_MAIL_ATTACHMENTS_DIR", str(DATA_
 ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 COMPOSE_UPLOADS_DIR = ATTACHMENTS_DIR / "_compose"
 COMPOSE_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-SCHEDULED_DB = DATA_DIR / "scheduled_emails.db"
+
+
+def _sqlite_database_path_from_url() -> Path | None:
+    """Return the main app.db path when DATABASE_URL points at a SQLite file."""
+    try:
+        from core.database import DATABASE_URL
+    except Exception:
+        return None
+    if not str(DATABASE_URL).startswith("sqlite:///"):
+        return None
+    raw_path = str(DATABASE_URL).replace("sqlite:///", "", 1)
+    if raw_path in ("", ":memory:"):
+        return None
+    return Path(raw_path)
+
+
+APP_SQLITE_DB = _sqlite_database_path_from_url()
+LEGACY_SCHEDULED_DB = Path(os.environ.get(
+    "ODYSSEUS_LEGACY_SCHEDULED_EMAILS_DB",
+    str((APP_SQLITE_DB.parent if APP_SQLITE_DB else DATA_DIR) / "scheduled_emails.db"),
+))
+# Raw SQL callers import this path. It now points at app.db for normal SQLite
+# deployments; the old scheduled_emails.db path is import-only legacy storage.
+SCHEDULED_DB = APP_SQLITE_DB or LEGACY_SCHEDULED_DB
+
+_SCHEDULED_STATE_TABLES = (
+    "scheduled_emails",
+    "email_summaries",
+    "email_ai_replies",
+    "email_tags",
+    "email_calendar_extractions",
+    "email_urgency_alerts",
+    "email_event_seen",
+    "email_boundaries",
+    "sender_signatures",
+)
+
+
+def _table_exists(conn, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone() is not None
+
+
+def _table_columns(conn, table: str) -> list[str]:
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def _import_legacy_scheduled_state(conn) -> None:
+    """Import legacy scheduled_emails.db rows into app.db without deleting it."""
+    try:
+        if not LEGACY_SCHEDULED_DB.exists():
+            return
+        if Path(SCHEDULED_DB).resolve() == LEGACY_SCHEDULED_DB.resolve():
+            return
+    except Exception:
+        return
+
+    import sqlite3
+
+    legacy = sqlite3.connect(LEGACY_SCHEDULED_DB)
+    try:
+        for table in _SCHEDULED_STATE_TABLES:
+            if not _table_exists(legacy, table) or not _table_exists(conn, table):
+                continue
+            source_cols = _table_columns(legacy, table)
+            target_cols = _table_columns(conn, table)
+            common_cols = [col for col in target_cols if col in source_cols]
+            if not common_cols:
+                continue
+            quoted_cols = ", ".join(f'"{col}"' for col in common_cols)
+            placeholders = ", ".join("?" for _ in common_cols)
+            rows = legacy.execute(f"SELECT {quoted_cols} FROM {table}").fetchall()
+            if not rows:
+                continue
+            conn.executemany(
+                f"INSERT OR IGNORE INTO {table} ({quoted_cols}) VALUES ({placeholders})",
+                rows,
+            )
+            logger.info("Imported %d legacy %s row(s) into app.db", len(rows), table)
+    finally:
+        legacy.close()
 
 
 def attachment_extract_dir(folder: str, uid: str) -> Path:
@@ -285,6 +367,7 @@ def attachment_extract_dir(folder: str, uid: str) -> Path:
 
 def _init_scheduled_db():
     import sqlite3
+    Path(SCHEDULED_DB).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(SCHEDULED_DB)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scheduled_emails (
@@ -462,6 +545,7 @@ def _init_scheduled_db():
             source TEXT
         )
     """)
+    _import_legacy_scheduled_state(conn)
     conn.commit()
     conn.close()
 
