@@ -559,7 +559,9 @@ def _get_email_config(account_id: str | None = None, owner: str = "") -> dict:
     except Exception as e:
         logger.debug(f"email_accounts lookup failed, falling back to settings store: {e}")
 
-    # Legacy fallback — flat keys in the settings store / env vars
+    # Legacy fallback — flat keys in settings.json / env vars
+    # src.settings now resolves those keys through the DB-backed settings store
+    # before falling back to the legacy JSON file.
     settings = _load_settings()
     cfg = {
         "account_id": resolved_id,

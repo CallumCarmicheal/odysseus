@@ -99,7 +99,9 @@ def setup_upload_routes(upload_handler):
                 raise HTTPException(404, "File not found")
         if not upload_handler.inside_base_dir(path):
             raise HTTPException(403, "Access denied")
-        # Look up original filename and owner from upload metadata.
+        # Look up original filename and owner from uploads.json
+        # The handler now resolves this through DB-backed upload metadata, with
+        # legacy uploads.json records kept as the fallback.
         original_name = file_id
         info = upload_handler.get_upload_info(file_id)
         if info:
@@ -142,7 +144,12 @@ def setup_upload_routes(upload_handler):
         return FileResponse(path, media_type=mime, filename=original_name)
 
     def _load_upload_info(file_id: str):
-        """Look up the upload metadata record for a file_id."""
+        """Look up the uploads.json record for a file_id, with owner/auth checks.
+
+        The handler now resolves this through DB-backed upload metadata, with
+        legacy uploads.json records kept as the fallback. Callers use the owner
+        from this record for owner/auth checks.
+        """
         return upload_handler.get_upload_info(file_id)
 
     def _vision_cache_path(file_id: str) -> str:

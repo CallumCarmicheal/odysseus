@@ -110,7 +110,8 @@ async def _auto_summarize_pass(days_back: int = 1, account_id: str | None = None
             ids = []
             names = {}
         if len(ids) <= 1:
-            # Single-account (or zero rows — fallback to legacy settings store lookup)
+            # Single-account (or zero rows — fallback to legacy settings.json lookup)
+            # The settings lookup is now mediated by src.settings/app.db.
             return await _auto_summarize_pass_single(days_back=days_back, account_id=(ids[0] if ids else None), progress_cb=progress_cb)
         outs = []
         for idx, aid in enumerate(ids, start=1):

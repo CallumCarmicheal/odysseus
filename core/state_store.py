@@ -123,7 +123,9 @@ def _ensure_legacy_preferences_imported(db) -> None:
             logger.info("Imported %d legacy user preference row(s) into app.db", imported)
         return
 
-    # Flat format -> import under the primary admin user for backward compat.
+    # Flat format -> nest under the primary admin user for backward compat.
+    # If no admin exists yet, keep the legacy auth-off behavior under the
+    # global owner key until a user-specific preference row is saved.
     primary = _primary_username(db)
     _upsert_preferences(db, primary, raw)
     logger.info(

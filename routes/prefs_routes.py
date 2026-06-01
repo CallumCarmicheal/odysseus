@@ -1,4 +1,7 @@
-"""User preferences API — per-user key/value store backed by app.db."""
+"""User preferences API — per-user key/value store backed by app.db.
+
+Legacy JSON file support is kept for staged deployments and DB fallback.
+"""
 import json
 import logging
 import os

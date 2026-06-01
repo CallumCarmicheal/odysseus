@@ -135,7 +135,9 @@ DEFAULT_FEATURES = {
 }
 
 
-# ── Settings (app.db; legacy data/settings.json fallback) ──
+# ── Settings (data/settings.json) ──
+# Runtime settings are app.db-backed; data/settings.json remains the legacy
+# import source and DB-unavailable fallback.
 
 def _load_legacy_json(path: str) -> dict:
     """Load legacy JSON state for partial deployments and DB-unavailable fallback."""
@@ -171,6 +173,7 @@ def save_settings(settings: dict):
         save_app_settings(settings)
     except Exception as exc:
         logger.warning("DB-backed settings unavailable; falling back to JSON: %s", exc)
+        # Persist settings to disk (atomic; see core.atomic_io).
         # JSON fallback remains atomic; see core.atomic_io.
         from core.atomic_io import atomic_write_json
         atomic_write_json(SETTINGS_FILE, settings, indent=2)
@@ -217,7 +220,9 @@ def get_user_setting(key: str, owner: str = "", default: Any = None) -> Any:
     return get_setting(key, default)
 
 
-# ── Features (app.db; legacy data/features.json fallback) ──
+# ── Features (data/features.json) ──
+# Runtime feature flags are app.db-backed; data/features.json remains the
+# legacy import source and DB-unavailable fallback.
 
 def load_features() -> dict:
     """Load feature flags merged with defaults."""
@@ -243,6 +248,7 @@ def save_features(features: dict):
         save_feature_flags(features)
     except Exception as exc:
         logger.warning("DB-backed feature flags unavailable; falling back to JSON: %s", exc)
+        # Persist feature flags to disk (atomic).
         # JSON fallback remains atomic; see core.atomic_io.
         from core.atomic_io import atomic_write_json
         atomic_write_json(FEATURES_FILE, features, indent=2)

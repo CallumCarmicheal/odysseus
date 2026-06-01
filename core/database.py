@@ -1189,9 +1189,7 @@ def _migrate_assign_legacy_owner():
     db_path = DATABASE_URL.replace("sqlite:///", "")
 
     # Prefer the DB-backed users table. Fall back to auth.json for deployments
-    # that have not completed the auth import yet. The legacy auth schema uses
-    # `is_admin: True`, not `role: "admin"` — old code looked for the wrong
-    # field and silently fell through to "first user" every time.
+    # that have not completed the auth import yet.
     admin_user = None
     if os.path.exists(db_path):
         try:
@@ -1211,6 +1209,9 @@ def _migrate_assign_legacy_owner():
     if not os.path.isabs(auth_path):
         auth_path = os.path.join("data", "auth.json")
     if not admin_user:
+        # Find admin user from auth.json. The auth schema uses `is_admin: True`,
+        # not `role: "admin"` — old code looked for the wrong field and silently
+        # fell through to "first user" every time.
         try:
             with open(auth_path, "r", encoding="utf-8") as f:
                 auth_data = _json.load(f)
@@ -1278,6 +1279,8 @@ def _migrate_assign_legacy_owner():
     except Exception as e:
         logger.warning(f"memory.json legacy migration failed: {e}")
 
+    # Also migrate user_prefs.json to per-user format
+    # Flat format → nest under admin user
     # user_prefs.json is now imported into app.db by core.state_store.
     # Do not rewrite the JSON file here; existing deployments may still use it
     # as a fallback during staged upgrades.

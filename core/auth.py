@@ -69,7 +69,10 @@ def _timestamp_to_datetime(value: Any) -> datetime | None:
 
 
 class AuthManager:
-    """Manages multi-user password, privilege, TOTP, and session-token auth."""
+    """Manages multi-user password + session-token auth system.
+
+    Privileges and TOTP state are included in the same DB-backed user record.
+    """
 
     def __init__(self, auth_path: str = DEFAULT_AUTH_PATH, session_factory=None):
         self.auth_path = auth_path
@@ -108,7 +111,7 @@ class AuthManager:
         return {}
 
     def _load_legacy_sessions(self) -> dict:
-        """Load persisted legacy session tokens from disk; expired ones are pruned on import."""
+        """Load persisted session tokens from disk, pruning expired ones."""
         try:
             if os.path.exists(self._sessions_path):
                 with open(self._sessions_path, "r", encoding="utf-8") as f:
@@ -119,7 +122,7 @@ class AuthManager:
         return {}
 
     def _legacy_users(self, config: dict) -> dict:
-        """Migrate old single-user format into the multi-user import shape."""
+        """Migrate old single-user format to multi-user format."""
         if "password_hash" in config and "users" not in config:
             username = normalize_username(config.get("username") or "admin") or "admin"
             return {
@@ -662,10 +665,10 @@ class AuthManager:
                 if row is None:
                     return False
                 if row.expires_at <= datetime.utcnow() or row.user is None:
-                    # SECURITY: if the user record has since been removed
-                    # (admin deleted them while their cookie was still valid),
-                    # drop the session so the next request kicks them out
-                    # instead of silently authenticating a non-existent account.
+                    # SECURITY: if the user record has since been removed (admin
+                    # deleted them while their cookie was still valid), drop the
+                    # session so the next request kicks them out instead of
+                    # silently authenticating against a non-existent account.
                     db.delete(row)
                     db.commit()
                     return False

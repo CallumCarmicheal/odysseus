@@ -454,7 +454,12 @@ class UploadHandler:
             logger.warning(f"Failed to update uploads database: {e}")
 
     def get_upload_info(self, upload_id: str) -> Optional[Dict[str, Any]]:
-        """Return the upload metadata row for an upload ID, if present."""
+        """Return the uploads.json metadata row for an upload ID, if present.
+
+        Runtime metadata is app.db-backed. Legacy uploads.json rows are
+        imported into app.db and remain the fallback when the database is
+        unavailable.
+        """
         if not self.validate_upload_id(upload_id):
             return None
         try:
@@ -687,6 +692,7 @@ class UploadHandler:
         # Calculate file hash for deduplication
         file_hash = self.calculate_file_hash(file_obj)
         
+        # Check for duplicate files
         # Check if this hash already exists for the same owner. Uploads are
         # access-controlled by owner, so cross-user dedupe must not return a
         # shared file ID.
@@ -753,6 +759,7 @@ class UploadHandler:
             except Exception as e:
                 logger.warning(f"Failed to read image dimensions for {file_id}: {e}")
         
+        # Update uploads database
         # Update upload metadata store. File bytes remain on disk.
         self._save_upload_metadata(file_metadata)
         
