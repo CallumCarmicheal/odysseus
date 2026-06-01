@@ -1632,7 +1632,7 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
             return {"response": f"Reset {key} to default ({DEFAULT_SETTINGS[key]}).", "exit_code": 0}
 
         elif action in ("disable_tool", "enable_tool", "list_tools"):
-            # Tool-toggle actions. These edit settings.json:disabled_tools
+            # Tool-toggle actions. These edit settings-store disabled_tools
             # (the global list read on every chat request) rather than
             # prefs.json. Friendly aliases accepted: "shell" -> "bash",
             # "search" -> "web_search", "browser" -> "builtin_browser",

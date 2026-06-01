@@ -1184,7 +1184,7 @@ def setup_model_routes(model_discovery):
         import json as _json
         # SECURITY: resolve the default endpoint + model from the CALLER's
         # per-user prefs ONLY. We deliberately do NOT fall back to the
-        # global `default_model` / `default_endpoint_id` in settings.json
+        # global `default_model` / `default_endpoint_id` in the settings store
         # for authenticated users — that's what was leaking the previous
         # admin's pick into every new account's composer. If the user has
         # no per-user default yet, we resolve via the owner-scoped endpoint

@@ -102,6 +102,34 @@ class AuthSetting(Base):
     value = Column(JSON, nullable=True)
 
 
+class UserPreference(TimestampMixin, Base):
+    """Per-user preferences imported from legacy user_prefs.json."""
+    __tablename__ = "user_preferences"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    owner_key = Column(String, nullable=False, unique=True, index=True)
+    preferences = Column(JSON, nullable=False, default=dict)
+
+    user = relationship("User")
+
+
+class AppSetting(TimestampMixin, Base):
+    """Mutable application setting value."""
+    __tablename__ = "app_settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(JSON, nullable=True)
+
+
+class FeatureFlag(TimestampMixin, Base):
+    """Mutable feature flag value."""
+    __tablename__ = "feature_flags"
+
+    key = Column(String, primary_key=True)
+    enabled = Column(Boolean, default=True, nullable=False)
+
+
 class Session(TimestampMixin, Base):
     """
     SQLAlchemy model for Session table.
@@ -1034,7 +1062,9 @@ def _migrate_assign_legacy_owner():
     db_path = DATABASE_URL.replace("sqlite:///", "")
 
     # Prefer the DB-backed users table. Fall back to auth.json for deployments
-    # that have not completed the auth import yet.
+    # that have not completed the auth import yet. The legacy auth schema uses
+    # `is_admin: True`, not `role: "admin"` — old code looked for the wrong
+    # field and silently fell through to "first user" every time.
     admin_user = None
     if os.path.exists(db_path):
         try:
@@ -1121,20 +1151,9 @@ def _migrate_assign_legacy_owner():
     except Exception as e:
         logger.warning(f"memory.json legacy migration failed: {e}")
 
-    # Also migrate user_prefs.json to per-user format
-    prefs_path = os.path.join("data", "user_prefs.json")
-    try:
-        if os.path.exists(prefs_path):
-            with open(prefs_path, "r", encoding="utf-8") as f:
-                prefs = _json.load(f)
-            if "_users" not in prefs and prefs:
-                # Flat format → nest under admin user
-                new_prefs = {"_users": {admin_user: prefs}}
-                with open(prefs_path, "w", encoding="utf-8") as f:
-                    _json.dump(new_prefs, f, indent=2)
-                logger.info(f"Migrated user_prefs.json to per-user format under '{admin_user}'")
-    except Exception as e:
-        logger.warning(f"user_prefs.json migration failed: {e}")
+    # user_prefs.json is now imported into app.db by core.state_store.
+    # Do not rewrite the JSON file here; existing deployments may still use it
+    # as a fallback during staged upgrades.
 
 
 def _migrate_backfill_document_owner_from_session():

@@ -1,7 +1,10 @@
 # src/settings.py
 """Centralized settings and features management.
 
-Single source of truth for reading/writing data/settings.json and data/features.json.
+Single source of truth for reading/writing mutable settings and feature flags.
+Runtime state is stored in app.db. Legacy JSON files are imported as a
+deployment fallback from data/settings.json and data/features.json, and used
+for writes only when the database is unavailable.
 All modules should import from here instead of accessing files directly.
 """
 
@@ -132,7 +135,17 @@ DEFAULT_FEATURES = {
 }
 
 
-# ── Settings (data/settings.json) ──
+# ── Settings (app.db; legacy data/settings.json fallback) ──
+
+def _load_legacy_json(path: str) -> dict:
+    """Load legacy JSON state for partial deployments and DB-unavailable fallback."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        return saved if isinstance(saved, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
 
 def load_settings() -> dict:
     """Load settings merged with defaults. Always returns a complete dict."""
@@ -141,19 +154,26 @@ def load_settings() -> dict:
     if _settings_cache and (now - _settings_cache[0]) < _CACHE_TTL:
         return _settings_cache[1]
     try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        merged = {**DEFAULT_SETTINGS, **saved}
-    except (FileNotFoundError, json.JSONDecodeError):
-        merged = dict(DEFAULT_SETTINGS)
+        from core.state_store import load_app_settings
+        saved = load_app_settings()
+    except Exception as exc:
+        logger.warning("DB-backed settings unavailable; falling back to JSON: %s", exc)
+        saved = _load_legacy_json(SETTINGS_FILE)
+    merged = {**DEFAULT_SETTINGS, **saved}
     _settings_cache = (now, merged)
     return merged
 
 
 def save_settings(settings: dict):
-    """Persist settings to disk (atomic; see core.atomic_io)."""
-    from core.atomic_io import atomic_write_json
-    atomic_write_json(SETTINGS_FILE, settings, indent=2)
+    """Persist settings to app.db, falling back to disk atomically if needed."""
+    try:
+        from core.state_store import save_app_settings
+        save_app_settings(settings)
+    except Exception as exc:
+        logger.warning("DB-backed settings unavailable; falling back to JSON: %s", exc)
+        # JSON fallback remains atomic; see core.atomic_io.
+        from core.atomic_io import atomic_write_json
+        atomic_write_json(SETTINGS_FILE, settings, indent=2)
     _invalidate_caches()
 
 
@@ -197,7 +217,7 @@ def get_user_setting(key: str, owner: str = "", default: Any = None) -> Any:
     return get_setting(key, default)
 
 
-# ── Features (data/features.json) ──
+# ── Features (app.db; legacy data/features.json fallback) ──
 
 def load_features() -> dict:
     """Load feature flags merged with defaults."""
@@ -206,17 +226,24 @@ def load_features() -> dict:
     if _features_cache and (now - _features_cache[0]) < _CACHE_TTL:
         return _features_cache[1]
     try:
-        with open(FEATURES_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        merged = {**DEFAULT_FEATURES, **saved}
-    except (FileNotFoundError, json.JSONDecodeError):
-        merged = dict(DEFAULT_FEATURES)
+        from core.state_store import load_feature_flags
+        saved = load_feature_flags()
+    except Exception as exc:
+        logger.warning("DB-backed feature flags unavailable; falling back to JSON: %s", exc)
+        saved = _load_legacy_json(FEATURES_FILE)
+    merged = {**DEFAULT_FEATURES, **saved}
     _features_cache = (now, merged)
     return merged
 
 
 def save_features(features: dict):
-    """Persist feature flags to disk (atomic)."""
-    from core.atomic_io import atomic_write_json
-    atomic_write_json(FEATURES_FILE, features, indent=2)
+    """Persist feature flags to app.db, falling back to disk atomically if needed."""
+    try:
+        from core.state_store import save_feature_flags
+        save_feature_flags(features)
+    except Exception as exc:
+        logger.warning("DB-backed feature flags unavailable; falling back to JSON: %s", exc)
+        # JSON fallback remains atomic; see core.atomic_io.
+        from core.atomic_io import atomic_write_json
+        atomic_write_json(FEATURES_FILE, features, indent=2)
     _invalidate_caches()

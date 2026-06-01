@@ -28,14 +28,13 @@ LOCAL_CONTACTS_FILE = DATA_DIR / "contacts.json"
 
 
 def _load_settings():
-    if SETTINGS_FILE.exists():
-        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    return {}
+    from src.settings import load_settings
+    return load_settings()
 
 
 def _save_settings(settings):
-    from core.atomic_io import atomic_write_json
-    atomic_write_json(str(SETTINGS_FILE), settings, indent=2)
+    from src.settings import save_settings
+    save_settings(settings)
 
 
 def _get_carddav_config():

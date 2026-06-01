@@ -366,8 +366,8 @@ Blocked paths (refused for safety): /api/auth/, /api/users/, /api/tokens/, /api/
 
 def get_builtin_overrides() -> dict:
     """User overrides for built-in tool descriptions (TOOL_SECTIONS).
-    Stored globally in settings.json so the user can preview + edit how
-    the assistant is told to use a native tool, with a revert path."""
+    Stored globally in the DB-backed settings store so the user can preview +
+    edit how the assistant is told to use a native tool, with a revert path."""
     try:
         from src.settings import get_setting
         ov = get_setting("builtin_tool_overrides", {})

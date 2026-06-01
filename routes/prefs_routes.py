@@ -1,11 +1,14 @@
-"""User preferences API — per-user key/value store backed by a JSON file."""
+"""User preferences API — per-user key/value store backed by app.db."""
 import json
+import logging
 import os
 from typing import Optional
 from fastapi import APIRouter, Request
+from core.state_store import load_user_preferences, save_user_preferences
 from src.auth_helpers import get_current_user
 
 PREFS_FILE = os.path.join("data", "user_prefs.json")
+logger = logging.getLogger(__name__)
 
 
 def _load():
@@ -25,19 +28,29 @@ def _save(prefs):
 
 def _load_for_user(user: Optional[str] = None) -> dict:
     """Load preferences for a specific user."""
-    all_prefs = _load()
-    if "_users" in all_prefs:
-        if user is None:
-            # Auth disabled — return first user's prefs for backward compat
-            users = all_prefs["_users"]
-            return dict(next(iter(users.values()), {}))
-        return dict(all_prefs["_users"].get(user, {}))
-    # Legacy flat format — return as-is
-    return dict(all_prefs)
+    try:
+        return load_user_preferences(user)
+    except Exception as exc:
+        logger.warning("DB-backed preferences unavailable; falling back to JSON: %s", exc)
+        all_prefs = _load()
+        if "_users" in all_prefs:
+            if user is None:
+                # Auth disabled — return first user's prefs for backward compat
+                users = all_prefs["_users"]
+                return dict(next(iter(users.values()), {}))
+            return dict(all_prefs["_users"].get(user, {}))
+        # Legacy flat format — return as-is
+        return dict(all_prefs)
 
 
 def _save_for_user(user: Optional[str], prefs: dict):
     """Save preferences for a specific user."""
+    try:
+        save_user_preferences(user, prefs)
+        return
+    except Exception as exc:
+        logger.warning("DB-backed preferences unavailable; falling back to JSON: %s", exc)
+
     all_prefs = _load()
     if user is None:
         # Auth disabled — save flat

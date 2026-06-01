@@ -470,14 +470,13 @@ _init_scheduled_db()
 
 
 def _load_settings():
-    if SETTINGS_FILE.exists():
-        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    return {}
+    from src.settings import load_settings
+    return load_settings()
 
 
 def _save_settings(settings):
-    from core.atomic_io import atomic_write_json
-    atomic_write_json(str(SETTINGS_FILE), settings, indent=2)
+    from src.settings import save_settings
+    save_settings(settings)
 
 
 def _get_email_config(account_id: str | None = None, owner: str = "") -> dict:
@@ -487,8 +486,8 @@ def _get_email_config(account_id: str | None = None, owner: str = "") -> dict:
       1. If account_id given → that specific EmailAccount row.
       2. Else → the row with is_default=True (scoped to `owner` when given).
       3. Else → the first enabled row (scoped to `owner` when given).
-      4. Else → legacy flat keys in data/settings.json (kept for envs
-         where the migration hasn't run yet or accounts table is empty).
+      4. Else → legacy flat keys from the settings store (kept for envs
+         where account migration hasn't run yet or accounts table is empty).
       5. Else → env vars (SMTP_HOST / IMAP_HOST / ...).
 
     Returned dict always has the same shape as before; an `account_id` key is
@@ -558,9 +557,9 @@ def _get_email_config(account_id: str | None = None, owner: str = "") -> dict:
         finally:
             db.close()
     except Exception as e:
-        logger.debug(f"email_accounts lookup failed, falling back to settings.json: {e}")
+        logger.debug(f"email_accounts lookup failed, falling back to settings store: {e}")
 
-    # Legacy fallback — flat keys in settings.json / env vars
+    # Legacy fallback — flat keys in the settings store / env vars
     settings = _load_settings()
     cfg = {
         "account_id": resolved_id,

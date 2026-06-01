@@ -2784,7 +2784,7 @@ def setup_email_routes():
         cfg = _get_email_config(owner=owner)
         cfg["smtp_password"] = "***" if cfg["smtp_password"] else ""
         cfg["imap_password"] = "***" if cfg["imap_password"] else ""
-        # Include preferences from settings.json
+        # Include preferences from the DB-backed settings store.
         settings = _load_settings()
         cfg["email_auto_summarize"] = bool(settings.get("email_auto_summarize", False))
         cfg["email_auto_reply"] = bool(settings.get("email_auto_reply", False))
@@ -2797,12 +2797,12 @@ def setup_email_routes():
     async def update_email_config(data: dict, owner: str = Depends(require_owner)):
         """Update email configuration.
 
-        Automation flags (email_auto_*) still live in settings.json. Credentials
+        Automation flags (email_auto_*) still live in the DB-backed settings store. Credentials
         are written to the default EmailAccount row. Passwords are only
         overwritten when a non-empty value is provided, so saving the form
         without retyping the password no longer wipes it.
         """
-        # Automation flags stay in settings.json (they're global, not per-account)
+        # Automation flags stay in the settings store (they're global, not per-account)
         settings = _load_settings()
         for key in ["email_auto_summarize", "email_auto_reply", "email_auto_tag", "email_auto_spam", "email_auto_calendar"]:
             if key in data:
