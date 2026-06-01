@@ -254,10 +254,215 @@ class UploadHandler:
             logger.warning(f"Failed to read uploads database: {e}")
             return {}
 
+    def _parse_upload_time(self, value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except Exception:
+            return None
+
+    def _owner_id_for(self, db, owner: Optional[str]) -> Optional[int]:
+        if not owner:
+            return None
+        try:
+            from core.database import User
+            from core.identity import resolve_user_id
+            return resolve_user_id(db, User, owner)
+        except Exception:
+            return None
+
+    def _metadata_from_row(self, row) -> Dict[str, Any]:
+        return {
+            "id": row.public_id,
+            "path": row.storage_path,
+            "mime": row.mime_type or "application/octet-stream",
+            "size": int(row.size_bytes or 0),
+            "name": row.stored_name or row.original_name,
+            "hash": row.sha256,
+            "original_name": row.original_name or row.stored_name,
+            "uploaded_at": (row.created_at or datetime.now()).isoformat(),
+            "last_accessed": (row.last_accessed_at or row.updated_at or row.created_at or datetime.now()).isoformat(),
+            "client_ip": row.client_ip,
+            "owner": row.owner,
+            "width": row.width,
+            "height": row.height,
+        }
+
+    def _flush_upload_metadata(self, db) -> None:
+        if db.new or db.dirty or db.deleted:
+            db.flush()
+
+    def _apply_metadata_to_row(self, db, row, metadata: Dict[str, Any]):
+        row.public_id = metadata["id"]
+        row.storage_path = metadata.get("path") or ""
+        row.mime_type = metadata.get("mime") or "application/octet-stream"
+        row.size_bytes = int(metadata.get("size") or 0)
+        row.stored_name = metadata.get("name") or os.path.basename(row.storage_path) or metadata["id"]
+        row.original_name = metadata.get("original_name") or row.stored_name
+        row.sha256 = metadata.get("hash") or ""
+        row.owner = metadata.get("owner")
+        row.owner_id = self._owner_id_for(db, row.owner)
+        row.width = metadata.get("width")
+        row.height = metadata.get("height")
+        row.client_ip = metadata.get("client_ip")
+        row.last_accessed_at = self._parse_upload_time(metadata.get("last_accessed")) or datetime.now()
+        uploaded_at = self._parse_upload_time(metadata.get("uploaded_at"))
+        if uploaded_at and not getattr(row, "created_at", None):
+            row.created_at = uploaded_at
+        row.updated_at = datetime.now()
+
+    def _ensure_upload_metadata_imported(self, db) -> None:
+        """Import legacy uploads.json rows into stored_files when missing."""
+        from core.database import StoredFile
+
+        legacy = self._load_upload_index()
+        if not legacy:
+            return
+        imported = 0
+        for info in legacy.values():
+            if not isinstance(info, dict):
+                continue
+            upload_id = info.get("id")
+            if not self.validate_upload_id(upload_id):
+                continue
+            existing = db.query(StoredFile).filter(StoredFile.public_id == upload_id).first()
+            if existing is not None:
+                continue
+            row = StoredFile(
+                public_id=upload_id,
+                storage_path=info.get("path") or "",
+                mime_type=info.get("mime") or "application/octet-stream",
+                size_bytes=int(info.get("size") or 0),
+                stored_name=info.get("name") or upload_id,
+                original_name=info.get("original_name") or info.get("name") or upload_id,
+                sha256=info.get("hash") or "",
+                owner=info.get("owner"),
+                owner_id=self._owner_id_for(db, info.get("owner")),
+                width=info.get("width"),
+                height=info.get("height"),
+                client_ip=info.get("client_ip"),
+                last_accessed_at=self._parse_upload_time(info.get("last_accessed")),
+                created_at=self._parse_upload_time(info.get("uploaded_at")) or datetime.now(),
+                updated_at=datetime.now(),
+            )
+            db.add(row)
+            imported += 1
+        if imported:
+            logger.info("Imported %d legacy upload metadata row(s) into app.db", imported)
+
+    def _get_upload_info_db(self, upload_id: str) -> Optional[Dict[str, Any]]:
+        from core.database import SessionLocal, StoredFile
+
+        db = SessionLocal()
+        try:
+            self._ensure_upload_metadata_imported(db)
+            self._flush_upload_metadata(db)
+            row = db.query(StoredFile).filter(StoredFile.public_id == upload_id).first()
+            if row is None:
+                db.commit()
+                return None
+            info = self._metadata_from_row(row)
+            db.commit()
+            return info
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _find_duplicate_upload_db(self, file_hash: str, owner: Optional[str]) -> Optional[Dict[str, Any]]:
+        from core.database import SessionLocal, StoredFile
+
+        db = SessionLocal()
+        try:
+            self._ensure_upload_metadata_imported(db)
+            self._flush_upload_metadata(db)
+            owner_id = self._owner_id_for(db, owner)
+            query = db.query(StoredFile).filter(StoredFile.sha256 == file_hash)
+            if owner_id is not None:
+                query = query.filter(StoredFile.owner_id == owner_id)
+            else:
+                query = query.filter(StoredFile.owner == owner)
+            row = query.order_by(StoredFile.id.asc()).first()
+            if row is None:
+                db.commit()
+                return None
+            row.last_accessed_at = datetime.now()
+            info = self._metadata_from_row(row)
+            db.commit()
+            return info
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _save_upload_metadata_db(self, metadata: Dict[str, Any]) -> None:
+        from core.database import SessionLocal, StoredFile
+
+        db = SessionLocal()
+        try:
+            self._ensure_upload_metadata_imported(db)
+            self._flush_upload_metadata(db)
+            row = db.query(StoredFile).filter(StoredFile.public_id == metadata["id"]).first()
+            if row is None:
+                row = StoredFile(
+                    public_id=metadata["id"],
+                    storage_path=metadata.get("path") or "",
+                    mime_type=metadata.get("mime") or "application/octet-stream",
+                    size_bytes=int(metadata.get("size") or 0),
+                    stored_name=metadata.get("name") or metadata["id"],
+                    original_name=metadata.get("original_name") or metadata.get("name") or metadata["id"],
+                    sha256=metadata.get("hash") or "",
+                )
+                db.add(row)
+            self._apply_metadata_to_row(db, row, metadata)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _find_duplicate_upload(self, file_hash: str, owner: Optional[str]) -> Optional[Dict[str, Any]]:
+        try:
+            return self._find_duplicate_upload_db(file_hash, owner)
+        except Exception as e:
+            logger.warning(f"DB-backed upload metadata unavailable; falling back to JSON: {e}")
+
+        for info in self._load_upload_index().values():
+            if isinstance(info, dict) and info.get("hash") == file_hash and info.get("owner") == owner:
+                return dict(info)
+        return None
+
+    def _save_upload_metadata(self, metadata: Dict[str, Any]) -> None:
+        try:
+            self._save_upload_metadata_db(metadata)
+            return
+        except Exception as e:
+            logger.warning(f"DB-backed upload metadata unavailable; falling back to JSON: {e}")
+
+        uploads_db_path = os.path.join(self.upload_dir, "uploads.json")
+        try:
+            all_files = self._load_upload_index()
+            storage_key = f"{metadata.get('owner')}:{metadata.get('hash')}" if metadata.get("owner") else metadata.get("hash")
+            all_files[storage_key] = metadata
+            with open(uploads_db_path, "w", encoding="utf-8") as f:
+                json.dump(all_files, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to update uploads database: {e}")
+
     def get_upload_info(self, upload_id: str) -> Optional[Dict[str, Any]]:
-        """Return the uploads.json metadata row for an upload ID, if present."""
+        """Return the upload metadata row for an upload ID, if present."""
         if not self.validate_upload_id(upload_id):
             return None
+        try:
+            info = self._get_upload_info_db(upload_id)
+            if info is not None:
+                return info
+        except Exception as e:
+            logger.warning(f"DB-backed upload metadata unavailable; falling back to JSON: {e}")
         for info in self._load_upload_index().values():
             if isinstance(info, dict) and info.get("id") == upload_id:
                 return dict(info)
@@ -370,6 +575,35 @@ class UploadHandler:
     def get_upload_stats(self) -> Dict[str, Any]:
         """Get statistics about uploaded files."""
         try:
+            from core.database import SessionLocal, StoredFile
+
+            db = SessionLocal()
+            try:
+                self._ensure_upload_metadata_imported(db)
+                self._flush_upload_metadata(db)
+                rows = db.query(StoredFile).all()
+                total_size = sum(int(row.size_bytes or 0) for row in rows)
+                file_types: Dict[str, int] = {}
+                for row in rows:
+                    mime = row.mime_type or "unknown"
+                    file_types[mime] = file_types.get(mime, 0) + 1
+                db.commit()
+                return {
+                    "total_files": len(rows),
+                    "total_size": total_size,
+                    "total_size_mb": round(total_size / (1024 * 1024), 2),
+                    "file_types": file_types,
+                    "cleanup_days": self.cleanup_days
+                }
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"DB-backed upload stats unavailable; falling back to JSON: {e}")
+
+        try:
             total_files = 0
             total_size = 0
             file_types = {}
@@ -453,38 +687,15 @@ class UploadHandler:
         # Calculate file hash for deduplication
         file_hash = self.calculate_file_hash(file_obj)
         
-        # Check for duplicate files
-        uploads_db_path = os.path.join(self.upload_dir, "uploads.json")
-        existing_files = {}
-        
-        if os.path.exists(uploads_db_path):
-            try:
-                with open(uploads_db_path, "r", encoding="utf-8") as f:
-                    existing_files = json.load(f)
-            except Exception as e:
-                logger.warning(f"Failed to read uploads database: {e}")
-        
         # Check if this hash already exists for the same owner. Uploads are
         # access-controlled by owner, so cross-user dedupe must not return a
         # shared file ID.
-        existing_key = None
-        existing_file = None
-        for key, info in existing_files.items():
-            if info.get("hash") == file_hash and info.get("owner") == owner:
-                existing_key = key
-                existing_file = info
-                break
+        existing_file = self._find_duplicate_upload(file_hash, owner)
         if existing_file:
             logger.info(f"Duplicate file upload detected: {original_filename} -> {existing_file['id']}")
             
             existing_file["last_accessed"] = datetime.now().isoformat()
-            existing_files[existing_key] = existing_file
-            
-            try:
-                with open(uploads_db_path, "w", encoding="utf-8") as f:
-                    json.dump(existing_files, f, indent=2)
-            except Exception as e:
-                logger.warning(f"Failed to update uploads database: {e}")
+            self._save_upload_metadata(existing_file)
             
             return {
                 "id": existing_file["id"],
@@ -542,25 +753,8 @@ class UploadHandler:
             except Exception as e:
                 logger.warning(f"Failed to read image dimensions for {file_id}: {e}")
         
-        # Update uploads database
-        try:
-            if os.path.exists(uploads_db_path):
-                try:
-                    with open(uploads_db_path, "r", encoding="utf-8") as f:
-                        all_files = json.load(f)
-                except Exception:
-                    all_files = {}
-            else:
-                all_files = {}
-            
-            storage_key = f"{owner}:{file_hash}" if owner else file_hash
-            all_files[storage_key] = file_metadata
-            
-            with open(uploads_db_path, "w", encoding="utf-8") as f:
-                json.dump(all_files, f, indent=2)
-                
-        except Exception as e:
-            logger.warning(f"Failed to update uploads database: {e}")
+        # Update upload metadata store. File bytes remain on disk.
+        self._save_upload_metadata(file_metadata)
         
         logger.info(f"File uploaded successfully: {original_filename} ({file_size} bytes)")
         return file_metadata

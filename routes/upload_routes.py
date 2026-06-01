@@ -1,7 +1,6 @@
 # routes/upload_routes.py
 import os
 import time
-import json
 import asyncio
 from fastapi import APIRouter, Request, File, UploadFile, HTTPException
 from typing import List
@@ -100,16 +99,11 @@ def setup_upload_routes(upload_handler):
                 raise HTTPException(404, "File not found")
         if not upload_handler.inside_base_dir(path):
             raise HTTPException(403, "Access denied")
-        # Look up original filename and owner from uploads.json
+        # Look up original filename and owner from upload metadata.
         original_name = file_id
-        info = None
-        uploads_db = os.path.join(UPLOAD_DIR, "uploads.json")
-        if os.path.exists(uploads_db):
-            with open(uploads_db, encoding="utf-8") as f:
-                db = json.load(f)
-            info = next((fi for fi in db.values() if fi["id"] == file_id), None)
-            if info:
-                original_name = info.get("name", file_id)
+        info = upload_handler.get_upload_info(file_id)
+        if info:
+            original_name = info.get("name", file_id)
         auth_mgr = getattr(request.app.state, "auth_manager", None)
         auth_configured = bool(auth_mgr and auth_mgr.is_configured)
         current_user = get_current_user(request)
@@ -148,15 +142,8 @@ def setup_upload_routes(upload_handler):
         return FileResponse(path, media_type=mime, filename=original_name)
 
     def _load_upload_info(file_id: str):
-        """Look up the uploads.json record for a file_id, with owner/auth checks."""
-        from src.constants import UPLOAD_DIR
-        info = None
-        uploads_db = os.path.join(UPLOAD_DIR, "uploads.json")
-        if os.path.exists(uploads_db):
-            with open(uploads_db, encoding="utf-8") as f:
-                db = json.load(f)
-            info = next((fi for fi in db.values() if fi["id"] == file_id), None)
-        return info
+        """Look up the upload metadata record for a file_id."""
+        return upload_handler.get_upload_info(file_id)
 
     def _vision_cache_path(file_id: str) -> str:
         from src.constants import UPLOAD_DIR

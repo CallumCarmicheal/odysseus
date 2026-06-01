@@ -130,6 +130,31 @@ class FeatureFlag(TimestampMixin, Base):
     enabled = Column(Boolean, default=True, nullable=False)
 
 
+class StoredFile(TimestampMixin, Base):
+    """Metadata for an uploaded file whose bytes remain on disk."""
+    __tablename__ = "stored_files"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    public_id = Column(String, nullable=False, unique=True, index=True)  # legacy upload id / API id
+    owner = Column(String, nullable=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    original_name = Column(String, nullable=False)
+    stored_name = Column(String, nullable=False)
+    storage_path = Column(Text, nullable=False)
+    mime_type = Column(String, nullable=True)
+    size_bytes = Column(Integer, nullable=False, default=0)
+    sha256 = Column(String(64), nullable=False, index=True)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    last_accessed_at = Column(DateTime, nullable=True)
+    client_ip = Column(String, nullable=True)
+
+    __table_args__ = (
+        Index('ix_stored_files_owner_hash', 'owner', 'sha256'),
+        Index('ix_stored_files_owner_id_hash', 'owner_id', 'sha256'),
+    )
+
+
 class Session(TimestampMixin, Base):
     """
     SQLAlchemy model for Session table.
