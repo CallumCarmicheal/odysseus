@@ -74,7 +74,14 @@ def _normalize_contact(contact: Dict) -> Dict:
     }
 
 
-def _load_local_contacts() -> List[Dict]:
+def _session():
+    from core.database import Base, LocalContact, SessionLocal, engine
+
+    Base.metadata.create_all(bind=engine, tables=[LocalContact.__table__])
+    return SessionLocal()
+
+
+def _load_legacy_local_contacts() -> List[Dict]:
     try:
         if not LOCAL_CONTACTS_FILE.exists():
             return []
@@ -86,10 +93,111 @@ def _load_local_contacts() -> List[Dict]:
         return []
 
 
-def _save_local_contacts(contacts: List[Dict]) -> None:
+def _save_legacy_local_contacts(contacts: List[Dict]) -> None:
     from core.atomic_io import atomic_write_json
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     atomic_write_json(str(LOCAL_CONTACTS_FILE), {"contacts": [_normalize_contact(c) for c in contacts]}, indent=2)
+
+
+def _row_to_contact(row) -> Dict:
+    return _normalize_contact({
+        "uid": row.uid,
+        "name": row.name,
+        "emails": list(row.emails or []),
+        "phones": list(row.phones or []),
+    })
+
+
+def _apply_contact_to_row(row, contact: Dict) -> None:
+    normalized = _normalize_contact(contact)
+    row.uid = normalized["uid"]
+    row.name = normalized["name"]
+    row.emails = normalized["emails"]
+    row.phones = normalized["phones"]
+
+
+def _ensure_legacy_contacts_imported(db) -> None:
+    from core.database import LocalContact
+
+    legacy = _load_legacy_local_contacts()
+    if not legacy:
+        return
+    imported = 0
+    for contact in legacy:
+        normalized = _normalize_contact(contact)
+        existing = db.query(LocalContact).filter(LocalContact.uid == normalized["uid"]).first()
+        if existing is not None:
+            continue
+        row = LocalContact(uid=normalized["uid"], name=normalized["name"])
+        _apply_contact_to_row(row, normalized)
+        db.add(row)
+        imported += 1
+    if imported:
+        logger.info("Imported %d legacy local contact row(s) into app.db", imported)
+
+
+def _load_local_contacts_db() -> List[Dict]:
+    from core.database import LocalContact
+
+    db = _session()
+    try:
+        _ensure_legacy_contacts_imported(db)
+        changed = bool(db.new or db.dirty)
+        if changed:
+            db.flush()
+        rows = db.query(LocalContact).order_by(LocalContact.name.asc(), LocalContact.uid.asc()).all()
+        contacts = [_row_to_contact(row) for row in rows]
+        if changed or db.new or db.dirty:
+            db.commit()
+        return contacts
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _save_local_contacts_db(contacts: List[Dict]) -> None:
+    from core.database import LocalContact
+
+    db = _session()
+    try:
+        _ensure_legacy_contacts_imported(db)
+        if db.new or db.dirty:
+            db.flush()
+        normalized = [_normalize_contact(c) for c in contacts]
+        desired = {c["uid"] for c in normalized}
+        for row in db.query(LocalContact).all():
+            if row.uid not in desired:
+                db.delete(row)
+        for contact in normalized:
+            row = db.query(LocalContact).filter(LocalContact.uid == contact["uid"]).first()
+            if row is None:
+                row = LocalContact(uid=contact["uid"], name=contact["name"])
+                db.add(row)
+            _apply_contact_to_row(row, contact)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _load_local_contacts() -> List[Dict]:
+    try:
+        return _load_local_contacts_db()
+    except Exception as e:
+        logger.warning(f"DB-backed local contacts unavailable; falling back to JSON: {e}")
+        return _load_legacy_local_contacts()
+
+
+def _save_local_contacts(contacts: List[Dict]) -> None:
+    try:
+        _save_local_contacts_db(contacts)
+    except Exception as e:
+        logger.warning(f"DB-backed local contacts unavailable; falling back to JSON: {e}")
+        _save_legacy_local_contacts(contacts)
     _contact_cache["contacts"] = [_normalize_contact(c) for c in contacts]
     _contact_cache["fetched_at"] = datetime.utcnow()
 

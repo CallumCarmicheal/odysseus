@@ -1086,6 +1086,7 @@ _OWNER_ID_BACKFILL_TABLES = (
     # some ORM classes do not currently map them.
     "calendar_events",
     "gallery_people",
+    "local_contacts",
     "task_runs",
     "user_tool_data",
     "webhooks",
@@ -1620,6 +1621,18 @@ class Integration(TimestampMixin, Base):
     type   = Column(String, nullable=False)  # "email", "rss", "webhook"
     config = Column(JSON, nullable=True)     # type-specific config
     enabled = Column(Boolean, default=True)
+
+
+class LocalContact(TimestampMixin, Base):
+    """Local address-book contact used when CardDAV is not configured."""
+    __tablename__ = "local_contacts"
+
+    uid = Column(String, primary_key=True, index=True)
+    owner = Column(String, nullable=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    name = Column(String, nullable=False, default="")
+    emails = Column(JSON, nullable=False, default=list)
+    phones = Column(JSON, nullable=False, default=list)
 
 
 
