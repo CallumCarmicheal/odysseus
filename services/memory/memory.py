@@ -100,11 +100,50 @@ class MemoryManager:
     
     def ensure_file_exists(self):
         """Create memory file if it doesn't exist."""
+        # memory.json is now the legacy fallback; app.db is the primary store.
         if not os.path.exists(self.memory_file):
             with open(self.memory_file, 'w', encoding='utf-8') as f:
                 json.dump([], f, ensure_ascii=False, indent=2)
-    
-    def load_all(self) -> List[Dict]:
+
+    def _db_session(self):
+        from core.database import SessionLocal
+        return SessionLocal()
+
+    def _owner_id_for(self, db, owner: str = None):
+        if not owner:
+            return None
+        try:
+            from core.database import User
+            from core.identity import resolve_user_id
+            return resolve_user_id(db, User, owner)
+        except Exception:
+            return None
+
+    def _entry_from_row(self, row) -> Dict:
+        entry = {
+            "id": row.id,
+            "text": row.text,
+            "timestamp": int(row.timestamp or int(time.time())),
+            "source": row.source or "unknown",
+            "category": row.category or "fact",
+        }
+        if row.owner:
+            entry["owner"] = row.owner
+        if row.session_id:
+            entry["session_id"] = row.session_id
+        return entry
+
+    def _apply_entry_to_row(self, db, row, entry: Dict):
+        row.id = entry["id"]
+        row.text = entry.get("text", "")
+        row.timestamp = int(entry.get("timestamp") or int(time.time()))
+        row.source = entry.get("source") or "user"
+        row.category = entry.get("category") or "fact"
+        row.owner = entry.get("owner")
+        row.owner_id = self._owner_id_for(db, row.owner)
+        row.session_id = entry.get("session_id")
+
+    def _load_legacy_json(self) -> List[Dict]:
         """Load all memory entries from JSON file (unfiltered)."""
         if not os.path.exists(self.memory_file):
             return []
@@ -119,6 +158,78 @@ class MemoryManager:
             return self._migrate_from_legacy()
 
         return []
+
+    def _ensure_db_imported(self, db):
+        from core.database import Memory
+
+        if db.query(Memory).count() > 0:
+            return
+
+        entries = self._load_legacy_json()
+        if not entries:
+            return
+
+        for entry in entries:
+            row = Memory(id=entry["id"], text=entry.get("text", ""))
+            self._apply_entry_to_row(db, row, entry)
+            db.add(row)
+        logger.info("Imported %d legacy memory row(s) into app.db", len(entries))
+
+    def _load_all_db(self) -> List[Dict]:
+        from core.database import Memory
+
+        db = self._db_session()
+        try:
+            self._ensure_db_imported(db)
+            changed = bool(db.new or db.dirty or db.deleted)
+            if changed:
+                db.flush()
+            rows = db.query(Memory).order_by(Memory.timestamp.asc()).all()
+            entries = [self._entry_from_row(row) for row in rows]
+            if changed or db.new or db.dirty:
+                db.commit()
+            return entries
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _save_db(self, entries: List[Dict]):
+        from core.database import Memory
+
+        db = self._db_session()
+        try:
+            self._ensure_db_imported(db)
+            if db.new or db.dirty:
+                db.flush()
+
+            entries = self._validate_entries(entries)
+            keep_ids = {entry["id"] for entry in entries}
+            for row in db.query(Memory).all():
+                if row.id not in keep_ids:
+                    db.delete(row)
+
+            for entry in entries:
+                row = db.query(Memory).filter(Memory.id == entry["id"]).first()
+                if row is None:
+                    row = Memory(id=entry["id"], text=entry.get("text", ""))
+                    db.add(row)
+                self._apply_entry_to_row(db, row, entry)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def load_all(self) -> List[Dict]:
+        """Load all memory entries from app.db (unfiltered), falling back to JSON."""
+        try:
+            return self._load_all_db()
+        except Exception as e:
+            logger.warning("DB-backed memory unavailable; falling back to JSON: %s", e)
+            return self._load_legacy_json()
 
     def load(self, owner: str = None) -> List[Dict]:
         """Load memory entries, filtered by owner."""
@@ -182,7 +293,7 @@ class MemoryManager:
             return []
     
     def save(self, entries: List[Dict]):
-        """Save memory entries to JSON file."""
+        """Save memory entries to app.db, falling back to JSON file if needed."""
         # Validate entries before saving
         for entry in entries:
             if "id" not in entry:
@@ -193,7 +304,14 @@ class MemoryManager:
                 entry["source"] = "user"
             if "category" not in entry:
                 entry["category"] = "fact"
-        
+
+        try:
+            self._save_db(entries)
+            return
+        except Exception as e:
+            logger.warning("DB-backed memory unavailable; falling back to JSON: %s", e)
+
+        # Save memory entries to JSON file.
         # Use atomic write
         tmp_file = self.memory_file + ".tmp"
         with open(tmp_file, "w", encoding="utf-8") as f:
