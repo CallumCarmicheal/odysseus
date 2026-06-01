@@ -147,6 +147,13 @@ def _ensure_data_dir() -> None:
     os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
 
 
+def _session():
+    from core.database import Base, Integration, SessionLocal, engine
+
+    Base.metadata.create_all(bind=engine, tables=[Integration.__table__])
+    return SessionLocal()
+
+
 def _encrypt_integration_secrets(integrations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Return storage-safe copies with API keys encrypted at rest."""
     safe: List[Dict[str, Any]] = []
@@ -187,7 +194,7 @@ def mask_integration_secret(integration: Dict[str, Any]) -> Dict[str, Any]:
     return safe
 
 
-def load_integrations() -> List[Dict[str, Any]]:
+def _load_legacy_integrations() -> List[Dict[str, Any]]:
     """Load all integrations from disk with secrets decrypted for runtime use."""
     if not os.path.exists(DATA_FILE):
         return []
@@ -198,18 +205,155 @@ def load_integrations() -> List[Dict[str, Any]]:
             log.error("Invalid integrations file shape: expected a list")
             return []
         if _has_plaintext_api_key(integrations):
-            save_integrations(_decrypt_integration_secrets(integrations))
+            _save_legacy_integrations(_decrypt_integration_secrets(integrations))
         return _decrypt_integration_secrets(integrations)
     except (json.JSONDecodeError, IOError) as exc:
         log.error("Failed to load integrations: %s", exc)
         return []
 
 
-def save_integrations(integrations: List[Dict[str, Any]]) -> None:
+def _save_legacy_integrations(integrations: List[Dict[str, Any]]) -> None:
     """Persist integrations list to disk with API keys encrypted at rest."""
     _ensure_data_dir()
     atomic_write_json(DATA_FILE, _encrypt_integration_secrets(integrations), indent=2)
     safe_chmod(DATA_FILE, 0o600)
+
+
+def _integration_type(item: Dict[str, Any]) -> str:
+    return str(item.get("preset") or item.get("type") or item.get("auth_type") or "api")
+
+
+def _owner_id_for(db, owner: Optional[str]) -> Optional[int]:
+    if not owner:
+        return None
+    try:
+        from core.database import User
+        from core.identity import resolve_user_id
+        return resolve_user_id(db, User, owner)
+    except Exception:
+        return None
+
+
+def _row_to_integration(row) -> Dict[str, Any]:
+    config = dict(row.config or {})
+    config["id"] = row.id
+    config.setdefault("name", row.name)
+    config.setdefault("type", row.type)
+    config["enabled"] = bool(row.enabled)
+    if row.owner:
+        config.setdefault("owner", row.owner)
+    return _decrypt_integration_secrets([config])[0]
+
+
+def _apply_integration_to_row(db, row, item: Dict[str, Any]) -> None:
+    safe = _encrypt_integration_secrets([dict(item)])[0]
+    row.id = str(safe.get("id") or uuid.uuid4().hex[:12])
+    safe["id"] = row.id
+    row.name = str(safe.get("name") or row.id)
+    row.type = _integration_type(safe)
+    row.owner = safe.get("owner")
+    row.owner_id = _owner_id_for(db, row.owner)
+    row.enabled = bool(safe.get("enabled", True))
+    row.config = safe
+
+
+def _ensure_legacy_imported(db) -> None:
+    from core.database import Integration
+
+    legacy = _load_legacy_integrations()
+    if not legacy:
+        return
+
+    imported = 0
+    for item in legacy:
+        if not isinstance(item, dict):
+            continue
+        item.setdefault("id", uuid.uuid4().hex[:12])
+        existing = db.query(Integration).filter(Integration.id == str(item["id"])).first()
+        if existing is not None:
+            continue
+        row = Integration(id=str(item["id"]), name=str(item.get("name") or item["id"]), type=_integration_type(item))
+        _apply_integration_to_row(db, row, item)
+        db.add(row)
+        imported += 1
+    if imported:
+        log.info("Imported %d legacy integration row(s) into app.db", imported)
+
+
+def _load_integrations_db() -> List[Dict[str, Any]]:
+    from core.database import Integration
+
+    db = _session()
+    try:
+        _ensure_legacy_imported(db)
+        changed = bool(db.new or db.dirty)
+        if changed:
+            db.flush()
+        rows = db.query(Integration).order_by(Integration.name.asc(), Integration.id.asc()).all()
+        integrations = [_row_to_integration(row) for row in rows]
+        if changed or db.new or db.dirty:
+            db.commit()
+        return integrations
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _save_integrations_db(integrations: List[Dict[str, Any]]) -> None:
+    from core.database import Integration
+
+    db = _session()
+    try:
+        _ensure_legacy_imported(db)
+        if db.new or db.dirty:
+            db.flush()
+
+        desired: List[Dict[str, Any]] = []
+        for item in integrations or []:
+            if not isinstance(item, dict):
+                continue
+            copy = dict(item)
+            copy.setdefault("id", uuid.uuid4().hex[:12])
+            desired.append(copy)
+
+        desired_ids = {str(item["id"]) for item in desired}
+        for row in db.query(Integration).all():
+            if row.id not in desired_ids:
+                db.delete(row)
+
+        for item in desired:
+            row = db.query(Integration).filter(Integration.id == str(item["id"])).first()
+            if row is None:
+                row = Integration(id=str(item["id"]), name=str(item.get("name") or item["id"]), type=_integration_type(item))
+                db.add(row)
+            _apply_integration_to_row(db, row, item)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def load_integrations() -> List[Dict[str, Any]]:
+    """Load all integrations from app.db with secrets decrypted for runtime use."""
+    try:
+        return _load_integrations_db()
+    except Exception as exc:
+        log.warning("DB-backed integrations unavailable; falling back to JSON: %s", exc)
+        return _load_legacy_integrations()
+
+
+def save_integrations(integrations: List[Dict[str, Any]]) -> None:
+    """Persist integrations list to app.db with API keys encrypted at rest."""
+    try:
+        _save_integrations_db(integrations)
+        return
+    except Exception as exc:
+        log.warning("DB-backed integrations unavailable; falling back to JSON: %s", exc)
+    _save_legacy_integrations(integrations)
 
 
 def get_integration(integration_id: str) -> Optional[Dict[str, Any]]:

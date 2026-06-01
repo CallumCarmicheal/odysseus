@@ -128,10 +128,23 @@ def test_readme_native_quickstart_uses_loopback():
 def _import_integrations(tmp_path, monkeypatch):
     """Import src.integrations with data + encryption key redirected to tmp."""
     _import_secret_storage(tmp_path, monkeypatch)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'app.db'}")
+    sys.modules.pop("core.database", None)
     sys.modules.pop("src.integrations", None)
     from src import integrations  # noqa: WPS433
     monkeypatch.setattr(integrations, "DATA_FILE", str(tmp_path / "integrations.json"))
     return integrations
+
+
+def _stored_integration_config(integration_id: str):
+    from core.database import Integration, SessionLocal
+
+    db = SessionLocal()
+    try:
+        row = db.query(Integration).filter(Integration.id == integration_id).one()
+        return dict(row.config or {})
+    finally:
+        db.close()
 
 
 def test_integrations_api_keys_are_encrypted_at_rest(tmp_path, monkeypatch):
@@ -147,9 +160,9 @@ def test_integrations_api_keys_are_encrypted_at_rest(tmp_path, monkeypatch):
         }
     ])
 
-    raw_text = (tmp_path / "integrations.json").read_text(encoding="utf-8")
-    raw = json.loads(raw_text)
-    assert raw[0]["api_key"].startswith("enc:")
+    raw = _stored_integration_config("miniflux")
+    raw_text = json.dumps(raw)
+    assert raw["api_key"].startswith("enc:")
     assert "secret-token" not in raw_text
 
     loaded = integrations.load_integrations()
@@ -176,6 +189,9 @@ def test_integrations_plaintext_keys_migrate_on_load(tmp_path, monkeypatch):
     loaded = integrations.load_integrations()
 
     assert loaded[0]["api_key"] == "legacy-secret"
+    raw = _stored_integration_config("legacy")
+    assert raw["api_key"].startswith("enc:")
+    assert "legacy-secret" not in json.dumps(raw)
     migrated_text = data_file.read_text(encoding="utf-8")
     migrated = json.loads(migrated_text)
     assert migrated[0]["api_key"].startswith("enc:")
@@ -186,6 +202,7 @@ def test_integrations_plaintext_keys_migrate_on_load(tmp_path, monkeypatch):
 
 def _import_q():
     sys.modules.pop("routes.email_helpers", None)
+    sys.modules.pop("core.database", None)
     from routes.email_helpers import _q  # noqa: WPS433
     return _q
 
