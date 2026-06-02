@@ -32,6 +32,7 @@ from core.database import (
 )
 from src.constants import DATA_DIR
 from src.memory_tidy_store import clear_memory_tidy_state
+from src.skills_usage_store import clear_skills_usage
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,7 @@ def setup_admin_wipe_routes(session_manager):
                 # Skills live as SKILL.md files under data/skills/. Drop
                 # the entire directory; the SkillsManager re-creates the
                 # tree on next write.
+                clear_skills_usage()
                 skills_dir = os.path.join(DATA_DIR, "skills")
                 count = 0
                 if os.path.isdir(skills_dir):

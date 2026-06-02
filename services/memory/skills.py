@@ -25,6 +25,7 @@ import os
 import time
 from typing import Dict, Iterable, List, Optional
 
+from src.skills_usage_store import load_skills_usage, save_skills_usage
 from .skill_format import Skill, slugify
 
 logger = logging.getLogger(__name__)
@@ -86,24 +87,10 @@ class SkillsManager:
     # ----------------------------------------------------------------------
 
     def _load_usage(self) -> Dict[str, Dict]:
-        if not os.path.exists(self.usage_file):
-            return {}
-        try:
-            with open(self.usage_file, encoding="utf-8") as f:
-                d = json.load(f)
-            return d if isinstance(d, dict) else {}
-        except Exception:
-            return {}
+        return load_skills_usage(self.usage_file)
 
     def _save_usage(self, usage: Dict[str, Dict]) -> None:
-        try:
-            from core.atomic_io import atomic_write_json
-            atomic_write_json(self.usage_file, usage, indent=2)
-        except Exception:
-            tmp = self.usage_file + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(usage, f, indent=2)
-            os.replace(tmp, self.usage_file)
+        save_skills_usage(self.usage_file, usage)
 
     def set_audit(self, name: str, verdict: str, by_teacher: bool = False,
                   worker_model: str = "", teacher_model: str = "") -> None:
