@@ -69,16 +69,17 @@ def _timestamp_to_datetime(value: Any) -> datetime | None:
 
 
 class AuthManager:
-    """Manages multi-user password + session-token auth system.
+    """Manages multi-user password + session-token auth system."""
 
-    Privileges and TOTP state are included in the same DB-backed user record.
-    """
+    # Privileges and TOTP state are included in the same DB-backed user record.
 
     def __init__(self, auth_path: str = DEFAULT_AUTH_PATH, session_factory=None):
         self.auth_path = auth_path
         self._sessions_path = os.path.join(os.path.dirname(auth_path), "sessions.json")
         self._session_factory = session_factory or self._default_session_factory()
-        # Guards mutations of persisted user_sessions rows.
+        # Guards mutations of persisted user_sessions rows. This is the
+        # DB-backed replacement for guarding self._sessions and the on-disk
+        # sessions.json file.
         # Validate/create/revoke run concurrently from the FastAPI threadpool.
         self._sessions_lock = threading.RLock()
         # Guards the first-run setup check-and-write so concurrent requests
@@ -136,6 +137,11 @@ class AuthManager:
         users = config.get("users", {})
         return users if isinstance(users, dict) else {}
 
+    @staticmethod
+    def _legacy_user_is_admin(raw_user: dict) -> bool:
+        """Normalize setup.py's old role='admin' marker to is_admin=True."""
+        return bool(raw_user.get("is_admin") or raw_user.get("role") == "admin")
+
     def _migrate_legacy_files(self) -> None:
         from core.database import AuthSetting, User, UserSession, backfill_owner_ids
 
@@ -152,8 +158,7 @@ class AuthManager:
                 if not username or not isinstance(raw_user, dict):
                     continue
                 existing = db.query(User).filter(User.username == username).first()
-                # Normalize setup.py's old role='admin' marker to is_admin=True.
-                is_admin = bool(raw_user.get("is_admin") or raw_user.get("role") == "admin")
+                is_admin = self._legacy_user_is_admin(raw_user)
                 privileges = raw_user.get("privileges")
                 if not isinstance(privileges, dict):
                     privileges = dict(ADMIN_PRIVILEGES if is_admin else DEFAULT_PRIVILEGES)
@@ -372,9 +377,10 @@ class AuthManager:
             target = self._get_user(db, username)
             if requester is None or target is None or not requester.is_admin:
                 return False
-            # Purge all sessions belonging to this user. validate_token also
-            # cross-checks the user relationship, but deleting eagerly kicks
-            # open browser tabs out on their next request.
+            # Purge all sessions belonging to this user. DB-backed
+            # validate_token also cross-checks the user relationship, but
+            # deleting eagerly prevents a deleted user's cookie from continuing
+            # until later cleanup.
             db.query(UserSession).filter(UserSession.user_id == target.id).delete(synchronize_session=False)
             db.delete(target)
             db.commit()
@@ -633,7 +639,8 @@ class AuthManager:
         expires_at = datetime.utcnow() + timedelta(seconds=TOKEN_TTL)
 
         with self._sessions_lock:
-            # Persist session tokens to app.db (atomic via commit, lock-guarded).
+            # Persist session tokens to app.db (atomic via commit,
+            # lock-guarded), replacing the old atomic sessions.json write.
             db = self._db()
             try:
                 user = self._get_user(db, username)
