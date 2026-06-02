@@ -7,6 +7,7 @@ from typing import List, Dict, Set, Any, Tuple
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+_PERSONAL_DOCS_STATE_KEY = "personal_docs_state"
 
 
 def extract_pdf_text(file_path: str) -> str:
@@ -175,46 +176,153 @@ class PersonalDocsManager:
         self._load_excluded()
         self.refresh_index()
 
-    def load_directories(self):
-        """Load the list of indexed directories from persistent storage."""
+    def _db_session(self):
+        from core.database import AppSetting, Base, SessionLocal, engine
+
+        Base.metadata.create_all(bind=engine, tables=[AppSetting.__table__])
+        return SessionLocal()
+
+    def _load_legacy_directories(self) -> List[str]:
         try:
             if os.path.exists(self.directories_file):
                 with open(self.directories_file, 'r', encoding="utf-8") as f:
-                    self.indexed_directories = json.load(f)
-                logger.info(f"Loaded {len(self.indexed_directories)} indexed directories")
-            else:
-                self.indexed_directories = []
+                    data = json.load(f)
+                return data if isinstance(data, list) else []
         except Exception as e:
             logger.error(f"Error loading directories: {e}")
-            self.indexed_directories = []
+        return []
 
-    def save_directories(self):
-        """Save the list of indexed directories to persistent storage."""
+    def _save_legacy_directories(self) -> None:
         try:
             with open(self.directories_file, 'w', encoding="utf-8") as f:
                 json.dump(self.indexed_directories, f, indent=2)
-            logger.info(f"Saved {len(self.indexed_directories)} indexed directories")
         except Exception as e:
             logger.error(f"Error saving directories: {e}")
 
-    def _load_excluded(self):
-        """Load the set of excluded file paths from persistent storage."""
+    def _load_legacy_excluded(self) -> Set[str]:
         try:
             if os.path.exists(self._excluded_file):
                 with open(self._excluded_file, 'r', encoding="utf-8") as f:
-                    self.excluded_files = set(json.load(f))
-            else:
-                self.excluded_files = set()
+                    data = json.load(f)
+                return set(data if isinstance(data, list) else [])
         except Exception as e:
             logger.error(f"Error loading excluded files: {e}")
-            self.excluded_files = set()
+        return set()
 
-    def _save_excluded(self):
+    def _save_legacy_excluded(self) -> None:
         try:
             with open(self._excluded_file, 'w', encoding="utf-8") as f:
                 json.dump(list(self.excluded_files), f)
         except Exception as e:
             logger.error(f"Error saving excluded files: {e}")
+
+    def _state_payload(self) -> Dict[str, Any]:
+        return {
+            "indexed_directories": list(self.indexed_directories or []),
+            "excluded_files": sorted(self.excluded_files or set()),
+        }
+
+    def _ensure_legacy_state_imported(self, db):
+        from core.database import AppSetting
+
+        row = db.query(AppSetting).filter(AppSetting.key == _PERSONAL_DOCS_STATE_KEY).first()
+        if row is not None:
+            return row
+
+        directories = self._load_legacy_directories()
+        excluded = sorted(self._load_legacy_excluded())
+        if not directories and not excluded:
+            return None
+
+        row = AppSetting(
+            key=_PERSONAL_DOCS_STATE_KEY,
+            value={"indexed_directories": directories, "excluded_files": excluded},
+        )
+        db.add(row)
+        logger.info(
+            "Imported legacy personal document state into app.db (%d directories, %d exclusions)",
+            len(directories),
+            len(excluded),
+        )
+        return row
+
+    def _load_state_db(self):
+        from core.database import AppSetting
+
+        db = self._db_session()
+        try:
+            row = self._ensure_legacy_state_imported(db)
+            changed = bool(db.new or db.dirty)
+            if changed:
+                db.flush()
+            if row is None:
+                row = db.query(AppSetting).filter(AppSetting.key == _PERSONAL_DOCS_STATE_KEY).first()
+            state = dict(row.value or {}) if row is not None else {}
+            self.indexed_directories = [
+                str(p) for p in (state.get("indexed_directories") or [])
+                if isinstance(p, str)
+            ]
+            self.excluded_files = {
+                str(p) for p in (state.get("excluded_files") or [])
+                if isinstance(p, str)
+            }
+            if changed or db.new or db.dirty:
+                db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _save_state_db(self):
+        from core.database import AppSetting
+
+        db = self._db_session()
+        try:
+            row = db.query(AppSetting).filter(AppSetting.key == _PERSONAL_DOCS_STATE_KEY).first()
+            if row is None:
+                db.add(AppSetting(key=_PERSONAL_DOCS_STATE_KEY, value=self._state_payload()))
+            else:
+                row.value = self._state_payload()
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def load_directories(self):
+        """Load the list of indexed directories from persistent storage."""
+        try:
+            self._load_state_db()
+            logger.info(f"Loaded {len(self.indexed_directories)} indexed directories")
+        except Exception as e:
+            logger.error(f"Error loading directories: {e}")
+            self.indexed_directories = self._load_legacy_directories()
+
+    def save_directories(self):
+        """Save the list of indexed directories to persistent storage."""
+        try:
+            self._save_state_db()
+            logger.info(f"Saved {len(self.indexed_directories)} indexed directories")
+        except Exception as e:
+            logger.error(f"Error saving directories: {e}")
+            self._save_legacy_directories()
+
+    def _load_excluded(self):
+        """Load the set of excluded file paths from persistent storage."""
+        try:
+            self._load_state_db()
+        except Exception as e:
+            logger.error(f"Error loading excluded files: {e}")
+            self.excluded_files = self._load_legacy_excluded()
+
+    def _save_excluded(self):
+        try:
+            self._save_state_db()
+        except Exception as e:
+            logger.error(f"Error saving excluded files: {e}")
+            self._save_legacy_excluded()
 
     def exclude_file(self, filepath: str):
         """Exclude a file from the listing. Persists across restarts."""
