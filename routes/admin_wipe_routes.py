@@ -31,6 +31,7 @@ from core.database import (
     CalendarCal,
 )
 from src.constants import DATA_DIR
+from src.memory_tidy_store import clear_memory_tidy_state
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ logger = logging.getLogger(__name__)
 def _wipe_memory_files():
     """Blank memory.json + drop the per-owner tidy-state sidecar so the
     next audit doesn't try to diff against gone memories."""
+    clear_memory_tidy_state()
     for name in ("memory.json", "memory_tidy_state.json"):
         p = os.path.join(DATA_DIR, name)
         if not os.path.exists(p):

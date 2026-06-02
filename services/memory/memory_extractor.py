@@ -17,6 +17,8 @@ import os
 import re
 from typing import Optional
 
+from src.memory_tidy_store import load_memory_tidy_state, save_memory_tidy_state
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,12 +46,7 @@ def _fingerprint_entries(entries) -> str:
 
 def _load_tidy_state(memory_manager) -> dict:
     path = _tidy_state_path(memory_manager)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    return load_memory_tidy_state(path)
 
 
 def _save_tidy_state(memory_manager, owner: Optional[str], fingerprint: str) -> None:
@@ -57,8 +54,7 @@ def _save_tidy_state(memory_manager, owner: Optional[str], fingerprint: str) -> 
     state = _load_tidy_state(memory_manager)
     state[owner or ""] = {"fingerprint": fingerprint}
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
+        save_memory_tidy_state(path, state)
     except OSError as e:
         logger.warning(f"Could not persist tidy fingerprint: {e}")
 
