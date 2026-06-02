@@ -8,19 +8,22 @@ if needed.
 Includes a task registry so research survives page refreshes and can be cancelled.
 """
 import asyncio
-import json
 import logging
 import re
 import time
-from pathlib import Path
 from typing import Optional, Dict
 
+from src.research_store import (
+    RESEARCH_DATA_DIR,
+    average_completed_duration,
+    load_research_result,
+    mark_research_consumed,
+    save_research_result,
+    update_research_result,
+)
 from src.research_utils import strip_thinking, is_low_quality
 
 logger = logging.getLogger(__name__)
-
-RESEARCH_DATA_DIR = Path("data/deep_research")
-
 
 def _bounded_int(value, *, default: int, minimum: int, maximum: int) -> int:
     try:
@@ -295,21 +298,15 @@ class ResearchHandler:
             if avg is not None:
                 result["avg_duration"] = round(avg, 1)
             return result
-        # Check disk for completed research (skip consumed results)
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if data.get("consumed"):
-                    return None
-                return {
-                    "status": data.get("status", "done"),
-                    "progress": {},
-                    "query": data.get("query", ""),
-                    "started_at": data.get("started_at", 0),
-                }
-            except Exception:
-                pass
+        # Check persisted research in app.db, importing legacy JSON if needed.
+        data = load_research_result(session_id)
+        if data and not data.get("consumed"):
+            return {
+                "status": data.get("status", "done"),
+                "progress": {},
+                "query": data.get("query", ""),
+                "started_at": data.get("started_at", 0),
+            }
         return None
 
     def cancel_research(self, session_id: str) -> bool:
@@ -334,16 +331,10 @@ class ResearchHandler:
             entry = self._active_tasks[session_id]
             if entry["status"] in ("done", "error", "cancelled"):
                 return entry.get("result")
-        # Check disk (skip consumed results)
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if data.get("consumed"):
-                    return None
-                return data.get("result")
-            except Exception:
-                pass
+        # Check persisted research in app.db, importing legacy JSON if needed.
+        data = load_research_result(session_id)
+        if data and not data.get("consumed"):
+            return data.get("result")
         return None
 
     def get_sources(self, session_id: str) -> Optional[list]:
@@ -356,14 +347,10 @@ class ResearchHandler:
             researcher = entry.get("researcher")
             if researcher and researcher.findings:
                 return self._extract_sources(researcher.findings)
-        # Check disk
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                return data.get("sources")
-            except Exception:
-                pass
+        # Check persisted research in app.db, importing legacy JSON if needed.
+        data = load_research_result(session_id)
+        if data:
+            return data.get("sources")
         return None
 
     def get_raw_findings(self, session_id: str) -> Optional[list]:
@@ -373,14 +360,10 @@ class ResearchHandler:
             researcher = entry.get("researcher")
             if researcher and researcher.findings:
                 return self._extract_raw_findings(researcher.findings)
-        # Check disk
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                return data.get("raw_findings")
-            except Exception as e:
-                logger.warning(f"Failed to read raw findings for {session_id}: {e}")
+        # Check persisted research in app.db, importing legacy JSON if needed.
+        data = load_research_result(session_id)
+        if data:
+            return data.get("raw_findings")
         return None
 
     @staticmethod
@@ -420,42 +403,19 @@ class ResearchHandler:
             return []
 
     def get_avg_duration(self) -> Optional[float]:
-        """Compute average research duration from completed results on disk."""
-        durations = []
-        try:
-            for p in RESEARCH_DATA_DIR.glob("*.json"):
-                try:
-                    data = json.loads(p.read_text(encoding="utf-8"))
-                    if data.get("status") == "done":
-                        started = data.get("started_at", 0)
-                        completed = data.get("completed_at", 0)
-                        if started and completed and completed > started:
-                            durations.append(completed - started)
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        if durations:
-            return sum(durations) / len(durations)
-        return None
+        """Compute average research duration from completed persisted results."""
+        return average_completed_duration()
 
     def clear_result(self, session_id: str):
         """Mark result as consumed so it won't be re-rendered on refresh.
 
-        Keeps the JSON on disk so visual reports can be generated later.
+        Keeps the persisted report so visual reports can be generated later.
         """
         self._active_tasks.pop(session_id, None)
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                data["consumed"] = True
-                path.write_text(json.dumps(data), encoding="utf-8")
-            except Exception:
-                pass
+        mark_research_consumed(session_id)
 
     def _save_result(self, session_id: str, entry: dict):
-        """Persist completed research result to disk."""
+        """Persist completed research result to app.db."""
         try:
             # Extract and cache sources + raw findings
             sources = []
@@ -466,7 +426,6 @@ class ResearchHandler:
                 raw_findings = self._extract_raw_findings(researcher.findings)
             entry["sources"] = sources
 
-            path = RESEARCH_DATA_DIR / f"{session_id}.json"
             data = {
                 "query": entry["query"],
                 "status": entry["status"],
@@ -481,8 +440,8 @@ class ResearchHandler:
                 # SECURITY: stamp owner so route handlers can filter by user.
                 "owner": entry.get("owner", ""),
             }
-            path.write_text(json.dumps(data), encoding="utf-8")
-            logger.info(f"Research result saved to {path}")
+            save_research_result(session_id, data)
+            logger.info(f"Research result saved to app.db: {session_id}")
             try:
                 from src.event_bus import fire_event
                 fire_event("research_completed", entry.get("owner") or None)
@@ -492,26 +451,19 @@ class ResearchHandler:
             logger.error(f"Failed to save research result: {e}")
 
     def _get_session_json(self, session_id: str) -> Optional[dict]:
-        """Load the saved research JSON for a session, if it exists."""
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
-        if path.exists():
-            try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return None
+        """Load the saved research payload for a session, if it exists."""
+        return load_research_result(session_id)
 
     def get_report_html(self, session_id: str) -> Optional[str]:
-        """Generate the visual HTML report for a session (always fresh from JSON)."""
-        json_path = RESEARCH_DATA_DIR / f"{session_id}.json"
-        if not json_path.exists():
-            logger.warning(f"No JSON found for visual report: {json_path}")
+        """Generate the visual HTML report for a session from persisted data."""
+        data = self._get_session_json(session_id)
+        if not data:
+            logger.warning(f"No persisted research found for visual report: {session_id}")
             return None
 
         try:
             from src.visual_report import generate_visual_report
 
-            data = json.loads(json_path.read_text(encoding="utf-8"))
             report_md = data.get("raw_report") or data.get("result", "")
             html_content = generate_visual_report(
                 question=data.get("query", ""),
@@ -530,16 +482,14 @@ class ResearchHandler:
 
     def hide_image(self, session_id: str, image_url: str) -> bool:
         """Add image_url to the persisted hidden_images list for a research."""
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
-        if not path.exists():
+        data = load_research_result(session_id)
+        if not data:
             return False
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
             hidden = data.get("hidden_images") or []
             if image_url not in hidden:
                 hidden.append(image_url)
-                data["hidden_images"] = hidden
-                path.write_text(json.dumps(data), encoding="utf-8")
+                update_research_result(session_id, {"hidden_images": hidden})
                 logger.info(f"Hid image {image_url[:80]} for research {session_id}")
             return True
         except Exception as e:
@@ -548,13 +498,11 @@ class ResearchHandler:
 
     def unhide_all_images(self, session_id: str) -> bool:
         """Clear the hidden_images list for a research."""
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
-        if not path.exists():
+        data = load_research_result(session_id)
+        if not data:
             return False
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            data["hidden_images"] = []
-            path.write_text(json.dumps(data), encoding="utf-8")
+            update_research_result(session_id, {"hidden_images": []})
             logger.info(f"Cleared hidden_images for research {session_id}")
             return True
         except Exception as e:

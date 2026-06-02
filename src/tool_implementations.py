@@ -3617,9 +3617,9 @@ async def do_edit_image(content: str, owner: Optional[str] = None) -> Dict:
 async def do_manage_research(content: str, owner: Optional[str] = None) -> Dict:
     """List, read/open, or delete saved deep-research results from the Library.
     Args (JSON): {"action": "list|read|delete", "id": "<id>", "search": "..."}.
-    Research is stored as data/deep_research/<id>.json (query, summary, sources)."""
-    import json as _json
-    from pathlib import Path as _Path
+    Research is stored in app.db with legacy data/deep_research/<id>.json fallback."""
+    from src.research_store import delete_research_result, list_research_results, load_research_result
+
     try:
         args = _parse_tool_args(content) if content.strip().startswith("{") else {}
     except ValueError:
@@ -3628,8 +3628,8 @@ async def do_manage_research(content: str, owner: Optional[str] = None) -> Dict:
         args = {}
     action = (args.get("action") or "list").lower()
     rid = (args.get("id") or args.get("session_id") or args.get("research_id") or "").strip()
-    data_dir = _Path("data/deep_research")
 
+    # Legacy fallback keeps the old file-path behavior:
     # SECURITY: the research id is interpolated straight into a filesystem
     # path (data/deep_research/<rid>.json) for read AND delete. Without this
     # gate an agent-supplied id like "../settings" or "../../etc/passwd"
@@ -3639,19 +3639,14 @@ async def do_manage_research(content: str, owner: Optional[str] = None) -> Dict:
     if rid and not re.fullmatch(r"[A-Za-z0-9_-]+", rid):
         return {"error": "Invalid research id."}
 
-    def _load(p):
-        try:
-            return _json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-
     if action in ("read", "open", "view", "get"):
         if not rid:
             return {"error": "Provide the research id (from action='list')."}
-        p = data_dir / f"{rid}.json"
-        if not p.exists():
+        d = load_research_result(rid) or {}
+        if not d:
             return {"error": f"Research '{rid}' not found."}
-        d = _load(p) or {}
+        if owner and d.get("owner") != owner:
+            return {"error": f"Research '{rid}' not found."}
         summary = d.get("result") or d.get("raw_report") or d.get("summary") or d.get("report") or "(no report body)"
         srcs = d.get("sources", []) or []
         out = f"# {d.get('query', '(untitled)')}\n\n{summary}"
@@ -3664,27 +3659,19 @@ async def do_manage_research(content: str, owner: Optional[str] = None) -> Dict:
     if action == "delete":
         if not rid:
             return {"error": "Provide the research id to delete (from action='list')."}
-        p = data_dir / f"{rid}.json"
-        if p.exists():
-            try:
-                p.unlink()
-            except Exception as e:
-                return {"error": f"Failed to delete: {e}"}
+        d = load_research_result(rid) or {}
+        if d and (not owner or d.get("owner") == owner):
+            if not delete_research_result(rid):
+                return {"error": f"Failed to delete research '{rid}'."}
             return {"output": f"Deleted research '{rid}'.", "exit_code": 0}
         return {"error": f"Research '{rid}' not found."}
 
     # default: list — clickable [query](#research-<id>) rows, most-recent first
     search = (args.get("search") or "").lower()
     items = []
-    if data_dir.exists():
-        for p in data_dir.glob("*.json"):
-            d = _load(p)
-            if not d:
-                continue
-            q = d.get("query", "")
-            if search and search not in q.lower():
-                continue
-            items.append((d.get("completed_at", 0) or 0, p.stem, q, len(d.get("sources", []) or [])))
+    for d in list_research_results(owner=owner, search=search or None):
+        q = d.get("query", "")
+        items.append((d.get("completed_at", 0) or 0, d.get("id", ""), q, len(d.get("sources", []) or [])))
     items.sort(reverse=True)
     if not items:
         return {"output": "No research found in the library." + (f" (search: {search})" if search else ""), "exit_code": 0}

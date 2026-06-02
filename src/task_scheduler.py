@@ -1555,7 +1555,8 @@ class TaskScheduler:
         """Execute a deep research task using DeepResearcher."""
         from core.database import Session as DbSession, ChatMessage
         from src.deep_research import DeepResearcher
-        from src.research_handler import RESEARCH_DATA_DIR, ResearchHandler
+        from src.research_handler import ResearchHandler
+        from src.research_store import save_research_result
         from src.research_utils import strip_thinking
         from src.settings import get_setting
 
@@ -1643,11 +1644,10 @@ class TaskScheduler:
                 except Exception:
                     pass
 
-        # Persist scheduled research in the same on-disk shape used by the
-        # Research panel. Without this, task research had Markdown output but
-        # no Library entry and no visual report route to open.
+        # Persist scheduled research in the same shape used by the Research
+        # panel. Without this, task research had Markdown output but no Library
+        # entry and no visual report route to open.
         try:
-            RESEARCH_DATA_DIR.mkdir(parents=True, exist_ok=True)
             findings = getattr(researcher, "findings", []) or []
             payload = {
                 "query": task.prompt or task.name or "Scheduled research",
@@ -1664,7 +1664,7 @@ class TaskScheduler:
                 "task_id": task.id,
                 "task_name": task.name,
             }
-            (RESEARCH_DATA_DIR / f"{session_id}.json").write_text(json.dumps(payload), encoding="utf-8")
+            save_research_result(session_id, payload)
             try:
                 from src.event_bus import fire_event
                 fire_event("research_completed", task.owner or None)

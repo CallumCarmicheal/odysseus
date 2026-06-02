@@ -1,7 +1,7 @@
 import os
 import logging
 from datetime import datetime
-from sqlalchemy import create_engine, Column, String, Text, Boolean, DateTime, Integer, ForeignKey, JSON, Index, func, text
+from sqlalchemy import create_engine, Column, String, Text, Boolean, DateTime, Integer, Float, ForeignKey, JSON, Index, func, text
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.declarative import declarative_base, declared_attr
 from sqlalchemy.orm import relationship, sessionmaker, backref
@@ -152,6 +152,37 @@ class StoredFile(TimestampMixin, Base):
     __table_args__ = (
         Index('ix_stored_files_owner_hash', 'owner', 'sha256'),
         Index('ix_stored_files_owner_id_hash', 'owner_id', 'sha256'),
+    )
+
+
+class ResearchResult(TimestampMixin, Base):
+    """Persisted deep-research result imported from legacy JSON sidecars."""
+    __tablename__ = "research_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    public_id = Column(String, nullable=False, unique=True, index=True)
+    owner = Column(String, nullable=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    query = Column(Text, nullable=False, default="")
+    status = Column(String, nullable=False, default="done", index=True)
+    result = Column(Text, nullable=True)
+    raw_report = Column(Text, nullable=True)
+    sources = Column(JSON, nullable=False, default=list)
+    raw_findings = Column(JSON, nullable=False, default=list)
+    stats = Column(JSON, nullable=True)
+    category = Column(String, nullable=True, index=True)
+    started_at = Column(Float, nullable=True)
+    completed_at = Column(Float, nullable=True, index=True)
+    consumed = Column(Boolean, default=False, nullable=False)
+    archived = Column(Boolean, default=False, nullable=False, index=True)
+    hidden_images = Column(JSON, nullable=False, default=list)
+    task_id = Column(String, nullable=True, index=True)
+    task_name = Column(String, nullable=True)
+    payload = Column(JSON, nullable=False, default=dict)
+
+    __table_args__ = (
+        Index("ix_research_results_owner_archived_completed", "owner", "archived", "completed_at"),
+        Index("ix_research_results_owner_id_archived_completed", "owner_id", "archived", "completed_at"),
     )
 
 
@@ -1090,6 +1121,7 @@ _OWNER_ID_BACKFILL_TABLES = (
     "task_runs",
     "user_tool_data",
     "webhooks",
+    "research_results",
 )
 
 
@@ -1245,7 +1277,7 @@ def _migrate_assign_legacy_owner():
             "calendars", "calendar_events", "integrations",
             "scheduled_tasks", "task_runs", "crew_members",
             "gallery_albums", "gallery_people", "user_tool_data",
-            "api_tokens", "webhooks",
+            "api_tokens", "webhooks", "research_results",
         ]
         for table in tables:
             try:

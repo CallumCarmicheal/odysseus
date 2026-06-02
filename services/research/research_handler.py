@@ -8,15 +8,18 @@ if needed.
 Includes a task registry so research survives page refreshes and can be cancelled.
 """
 import asyncio
-import json
 import logging
 import time
-from pathlib import Path
 from typing import Optional, Dict
 
-logger = logging.getLogger(__name__)
+from src.research_store import (
+    RESEARCH_DATA_DIR,
+    load_research_result,
+    mark_research_consumed,
+    save_research_result,
+)
 
-RESEARCH_DATA_DIR = Path("data/deep_research")
+logger = logging.getLogger(__name__)
 
 
 class ResearchHandler:
@@ -110,19 +113,15 @@ class ResearchHandler:
                 "query": entry["query"],
                 "started_at": entry["started_at"],
             }
-        # Check disk for completed research
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                return {
-                    "status": data.get("status", "done"),
-                    "progress": {},
-                    "query": data.get("query", ""),
-                    "started_at": data.get("started_at", 0),
-                }
-            except Exception:
-                pass
+        # Check persisted research in app.db, importing legacy JSON if needed.
+        data = load_research_result(session_id)
+        if data:
+            return {
+                "status": data.get("status", "done"),
+                "progress": {},
+                "query": data.get("query", ""),
+                "started_at": data.get("started_at", 0),
+            }
         return None
 
     def cancel_research(self, session_id: str) -> bool:
@@ -147,14 +146,10 @@ class ResearchHandler:
             entry = self._active_tasks[session_id]
             if entry["status"] in ("done", "error", "cancelled"):
                 return entry.get("result")
-        # Check disk
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                return data.get("result")
-            except Exception:
-                pass
+        # Check persisted research in app.db, importing legacy JSON if needed.
+        data = load_research_result(session_id)
+        if data:
+            return data.get("result")
         return None
 
     def get_sources(self, session_id: str) -> Optional[list]:
@@ -167,14 +162,10 @@ class ResearchHandler:
             researcher = entry.get("researcher")
             if researcher and researcher.findings:
                 return self._extract_sources(researcher.findings)
-        # Check disk
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                return data.get("sources")
-            except Exception:
-                pass
+        # Check persisted research in app.db, importing legacy JSON if needed.
+        data = load_research_result(session_id)
+        if data:
+            return data.get("sources")
         return None
 
     @staticmethod
@@ -191,17 +182,12 @@ class ResearchHandler:
         return sources
 
     def clear_result(self, session_id: str):
-        """Remove persisted result after it's been consumed."""
+        """Mark persisted result consumed after it's been rendered."""
         self._active_tasks.pop(session_id, None)
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
-        if path.exists():
-            try:
-                path.unlink()
-            except Exception:
-                pass
+        mark_research_consumed(session_id)
 
     def _save_result(self, session_id: str, entry: dict):
-        """Persist completed research result to disk."""
+        """Persist completed research result to app.db."""
         try:
             # Extract and cache sources
             sources = []
@@ -210,7 +196,6 @@ class ResearchHandler:
                 sources = self._extract_sources(researcher.findings)
             entry["sources"] = sources
 
-            path = RESEARCH_DATA_DIR / f"{session_id}.json"
             data = {
                 "query": entry["query"],
                 "status": entry["status"],
@@ -219,8 +204,8 @@ class ResearchHandler:
                 "started_at": entry["started_at"],
                 "completed_at": time.time(),
             }
-            path.write_text(json.dumps(data), encoding="utf-8")
-            logger.info(f"Research result saved to {path}")
+            save_research_result(session_id, data)
+            logger.info(f"Research result saved to app.db: {session_id}")
         except Exception as e:
             logger.error(f"Failed to save research result: {e}")
 
