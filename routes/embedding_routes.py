@@ -1,18 +1,18 @@
 # routes/embedding_routes.py
 """Routes for managing local fastembed embedding models and custom endpoints."""
 import os
-import json
 import shutil
 import logging
 import asyncio
-from pathlib import Path
 from fastapi import APIRouter, HTTPException, Form, Depends
-from core.constants import BASE_DIR
 from core.middleware import require_admin
+from src.embedding_config import (
+    clear_embedding_endpoint_config,
+    load_embedding_endpoint_config,
+    save_embedding_endpoint_config,
+)
 
 logger = logging.getLogger(__name__)
-
-_ENDPOINT_FILE = os.path.join(BASE_DIR, "data", "embedding_endpoint.json")
 
 # Track in-progress downloads
 _downloading: dict = {}
@@ -84,17 +84,11 @@ def _dir_size_mb(path: str) -> float:
 
 def _load_custom_endpoint() -> dict:
     """Load the saved custom embedding endpoint, if any."""
-    try:
-        if os.path.exists(_ENDPOINT_FILE):
-            return json.loads(Path(_ENDPOINT_FILE).read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
+    return load_embedding_endpoint_config()
 
 
 def _save_custom_endpoint(data: dict):
-    Path(_ENDPOINT_FILE).parent.mkdir(parents=True, exist_ok=True)
-    Path(_ENDPOINT_FILE).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    save_embedding_endpoint_config(data)
 
 
 def setup_embedding_routes():
@@ -289,8 +283,7 @@ def setup_embedding_routes():
     @router.delete("/endpoint")
     def clear_endpoint():
         """Clear the custom endpoint and revert to local fastembed."""
-        if os.path.exists(_ENDPOINT_FILE):
-            os.remove(_ENDPOINT_FILE)
+        clear_embedding_endpoint_config()
 
         # Remove from environment
         os.environ.pop("EMBEDDING_URL", None)

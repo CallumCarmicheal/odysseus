@@ -186,15 +186,10 @@ class FastEmbedClient:
 def _load_persisted_endpoint() -> dict:
     """Load the custom embedding endpoint saved from the admin panel."""
     try:
-        endpoint_file = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "data", "embedding_endpoint.json",
-        )
-        if os.path.exists(endpoint_file):
-            import json
-            data = json.loads(open(endpoint_file, encoding="utf-8").read())
-            if data.get("url"):
-                return data
+        from src.embedding_config import load_embedding_endpoint_config
+        data = load_embedding_endpoint_config()
+        if data.get("url"):
+            return data
     except Exception:
         pass
     return {}
