@@ -1,11 +1,11 @@
 """Search analytics, metrics tracking, and exception hierarchy."""
 
-import json
 import logging
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Any
 
+from src.search_analytics_store import default_search_analytics, load_search_analytics, save_search_analytics
 from .cache import cache_metrics
 
 logger = logging.getLogger(__name__)
@@ -20,6 +20,7 @@ error_logger.addHandler(_error_handler)
 error_logger.propagate = False
 
 # Analytics file
+# Legacy fallback/import source; app.db is the primary store.
 ANALYTICS_FILE = Path(__file__).resolve().parent.parent / "search_analytics.json"
 
 
@@ -46,40 +47,20 @@ class RateLimitError(SearchEngineError):
 # Analytics helpers
 # ----------------------------------------------------------------------
 def _load_analytics() -> Dict[str, Any]:
-    """Load analytics data from the JSON file, creating defaults if missing."""
-    if not ANALYTICS_FILE.exists():
-        default = {
-            "total_queries": 0,
-            "successful_queries": 0,
-            "failed_queries": 0,
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "query_patterns": {},
-        }
-        _save_analytics(default)
-        return default
+    """Load analytics data from app.db, creating defaults if missing."""
     try:
-        with open(ANALYTICS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return load_search_analytics(legacy_paths=[ANALYTICS_FILE])
     except Exception as e:
-        logger.warning(f"Failed to load analytics file: {e}")
-        return {
-            "total_queries": 0,
-            "successful_queries": 0,
-            "failed_queries": 0,
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "query_patterns": {},
-        }
+        logger.warning(f"Failed to load analytics data: {e}")
+        return default_search_analytics()
 
 
 def _save_analytics(data: Dict[str, Any]) -> None:
-    """Persist analytics data to the JSON file."""
+    """Persist analytics data to app.db, falling back to the JSON file."""
     try:
-        with open(ANALYTICS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        save_search_analytics(data, legacy_path=ANALYTICS_FILE)
     except Exception as e:
-        logger.warning(f"Failed to write analytics file: {e}")
+        logger.warning(f"Failed to write analytics data: {e}")
 
 
 def _record_query(query: str, success: bool, cache_hit: bool) -> None:
