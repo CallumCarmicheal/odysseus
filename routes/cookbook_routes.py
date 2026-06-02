@@ -28,6 +28,7 @@ from core.platform_compat import (
     which_tool,
 )
 from routes.shell_routes import TMUX_LOG_DIR
+from src.cookbook_store import load_cookbook_state, save_cookbook_state as persist_cookbook_state
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,6 @@ _HF_TOKEN_STATUS_SNIPPET = (
 
 def setup_cookbook_routes() -> APIRouter:
     router = APIRouter(tags=["cookbook"])
-    _cookbook_state_path = Path(os.environ.get("DATA_DIR", "data")) / "cookbook_state.json"
 
     def _mask_secret(value: str) -> str:
         if not value:
@@ -199,6 +199,8 @@ def setup_cookbook_routes() -> APIRouter:
 
     def _state_for_storage(state, on_disk=None):
         """Encrypt cookbook secrets before writing state to disk."""
+        # The encrypted state now lives in app.db; legacy JSON fallback writes
+        # the same payload to disk during staged upgrades.
         _strip_task_secrets(state)
         env = state.get("env") if isinstance(state, dict) else None
         disk_env = on_disk.get("env") if isinstance(on_disk, dict) and isinstance(on_disk.get("env"), dict) else {}
@@ -216,10 +218,8 @@ def setup_cookbook_routes() -> APIRouter:
         return state
 
     def _load_stored_hf_token() -> str:
-        if not _cookbook_state_path.exists():
-            return ""
         try:
-            state = json.loads(_cookbook_state_path.read_text(encoding="utf-8"))
+            state = load_cookbook_state()
             env = state.get("env") if isinstance(state, dict) else {}
             return _decrypt_secret(env.get("hfToken") if isinstance(env, dict) else "")
         except Exception:
@@ -1515,12 +1515,10 @@ def setup_cookbook_routes() -> APIRouter:
     async def get_cookbook_state(request: Request):
         """Load saved cookbook state (tasks, servers, presets, settings)."""
         require_admin(request)
-        if _cookbook_state_path.exists():
-            try:
-                return _state_for_client(json.loads(_cookbook_state_path.read_text(encoding="utf-8")))
-            except Exception:
-                return {}
-        return {}
+        try:
+            return _state_for_client(load_cookbook_state())
+        except Exception:
+            return {}
 
     @router.post("/api/cookbook/state")
     async def save_cookbook_state(request: Request):
@@ -1540,15 +1538,11 @@ def setup_cookbook_routes() -> APIRouter:
         require_admin(request)
         RACE_WINDOW_MS = 60_000
         try:
-            from core.atomic_io import atomic_write_json
             data = await request.json()
             if not isinstance(data, dict):
                 data = {}
             try:
-                if _cookbook_state_path.exists():
-                    on_disk = json.loads(_cookbook_state_path.read_text(encoding="utf-8"))
-                else:
-                    on_disk = {}
+                on_disk = load_cookbook_state()
             except Exception:
                 on_disk = {}
             # Anti-wipe guard for env servers. The UI debounces a
@@ -1588,7 +1582,7 @@ def setup_cookbook_routes() -> APIRouter:
                             f"not in incoming body (race guard): "
                             f"{[t.get('sessionId') for t in preserved]}")
                 data["tasks"] = incoming_tasks + preserved
-            atomic_write_json(str(_cookbook_state_path), _state_for_storage(data, on_disk), indent=2)
+            persist_cookbook_state(_state_for_storage(data, on_disk))
             return {"ok": True, "preserved": len(preserved)}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -1724,16 +1718,15 @@ def setup_cookbook_routes() -> APIRouter:
 
         # Load saved tasks from cookbook state
         tasks = []
-        if _cookbook_state_path.exists():
-            try:
-                state = json.loads(_cookbook_state_path.read_text(encoding="utf-8"))
-                saved_tasks = state.get("tasks", [])
-                if isinstance(saved_tasks, list):
-                    tasks = saved_tasks
-                elif isinstance(saved_tasks, dict):
-                    tasks = list(saved_tasks.values())
-            except Exception:
-                pass
+        try:
+            state = load_cookbook_state()
+            saved_tasks = state.get("tasks", [])
+            if isinstance(saved_tasks, list):
+                tasks = saved_tasks
+            elif isinstance(saved_tasks, dict):
+                tasks = list(saved_tasks.values())
+        except Exception:
+            pass
 
         results = []
         for task in tasks:
